@@ -1,0 +1,16 @@
+{application, etcdgun, [
+    {description, "An etcd client built on top of gun and egrpc."},
+    {vsn, "0.1.0"},
+    {registered, []},
+    {mod, {etcdgun_app, []}},
+    {applications, [
+        kernel,
+        stdlib,
+        gun,
+        egrpc
+    ]},
+    {env, []},
+    {modules, []},
+    {licenses, ["Apache-2.0"]},
+    {links, []}
+ ]}.
