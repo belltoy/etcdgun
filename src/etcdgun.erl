@@ -38,4 +38,4 @@ open(Client, Endpoints, Opts) ->
     etcdgun_client_sup:start_child(Client, Endpoints, Opts).
 
 close(Client) ->
-    etcdgun_client:stop(Client).
+    etcdgun_client_sup:stop_child(Client).

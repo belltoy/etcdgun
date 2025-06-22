@@ -10,8 +10,7 @@
 -behaviour(gen_server).
 
 -export([
-    start_link/3,
-    stop/1
+    start_link/3
 ]).
 
 -export([
@@ -84,10 +83,6 @@ sync_membership(Client, Members) ->
     Opts :: map(). %% TODO:
 start_link(Client, Endpoints, Options) ->
     gen_server:start_link({local, Client}, ?MODULE, {Client, Endpoints, Options}, []).
-
--spec stop(etcdgun:client()) -> ok | {error, term()}.
-stop(Client) ->
-    gen_server:stop(Client, shutdown, infinity).
 
 %%-------------------------------------------------------------------
 %% gen_server callbacks
