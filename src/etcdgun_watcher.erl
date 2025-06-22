@@ -64,7 +64,7 @@ init({Client, WatcherName, EventHandler, EventHandlerArgs, WatchRequest}) ->
         %% Try to load last revision if the watcher is being restarted.
         WatchRequest1 = load_lasst_revision(WatcherName, WatchRequest),
         %% Send the create request.
-        Stream1 = egrpc_stream:send(Stream, WatchRequest1, nofin),
+        Stream1 = egrpc_stream:send_msg(Stream, WatchRequest1, nofin),
 
         %% Receive the response header
         {ok, Stream2} ?= recv_response_header(Stream1, 5000),
@@ -166,7 +166,7 @@ is_normal({shutdown, _}) -> true;
 is_normal(_) -> false.
 
 recv_response_header(Stream, Timeout) ->
-    Res = egrpc_stream:recv_response_header(Stream, Timeout),
+    Res = egrpc_stream:recv_header(Stream, Timeout),
     case Res of
         {error, _Reason} ->
             egrpc_stream:cancel_stream(Stream);
@@ -175,7 +175,7 @@ recv_response_header(Stream, Timeout) ->
     Res.
 
 recv_create_watch_response(Stream, Timeout, Acc) ->
-    Res = case egrpc_stream:recv(Stream, Timeout, Acc) of
+    Res = case egrpc_stream:recv_msg(Stream, Timeout, Acc) of
               {ok, _Stream1, _, _Rest} = R -> R;
               {error, Reason} ->
                   ?LOG_ERROR("Failed to receive response header: ~p", [Reason]),
@@ -188,13 +188,13 @@ cancel_watch(#state{stream = Stream} = State) ->
     CancelRequest = #{request_union =>
                       {cancel_request, #{watch_id => State#state.watch_id}}
                      },
-    Stream1 = egrpc_stream:send(Stream, CancelRequest, nofin),
+    Stream1 = egrpc_stream:send_msg(Stream, CancelRequest, nofin),
     Stream2 = egrpc_stream:close_send(Stream1),
     await_cancel_response(update_stream(Stream2, State)).
 
 await_cancel_response(#state{buf = Buf, stream = Stream} = State) ->
     maybe
-        {ok, Stream1, Msg, Rest} ?= egrpc_stream:recv(Stream, 5000, Buf),
+        {ok, Stream1, Msg, Rest} ?= egrpc_stream:recv_msg(Stream, 5000, Buf),
         case process_response(Msg, update_stream(Stream1, State#state{buf = Rest})) of
             {noreply, State1, {continue, process_data}} ->
                 await_cancel_response(State1);

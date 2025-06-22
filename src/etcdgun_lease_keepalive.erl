@@ -62,7 +62,7 @@ handle_info({timeout, TRef, retry}, #state{client = Client, retry_ref = TRef} = 
     end;
 handle_info({timeout, TRef, keepalive}, #state{lease_id = LeaseId, timer_ref = TRef} = State) ->
     Request = #{'ID' => LeaseId},
-    Stream1 = egrpc_stream:send(State#state.stream, Request, nofin),
+    Stream1 = egrpc_stream:send_msg(State#state.stream, Request, nofin),
     {noreply, State#state{timer_ref = undefined, stream = Stream1}};
 
 %% Receive messages from the Gun connection
@@ -116,8 +116,8 @@ terminate(Reason, #state{stream = Stream} = _State) ->
 
 recv_create_response(Client, LeaseId, Stream, ConnPid, MRef) ->
     maybe
-        {ok, Stream1} ?= egrpc_stream:recv_response_header(Stream, 1000),
-        Res = egrpc_stream:recv(Stream1, 1000, <<>>),
+        {ok, Stream1} ?= egrpc_stream:recv_header(Stream, 1000),
+        Res = egrpc_stream:recv_msg(Stream1, 1000, <<>>),
         {ok, Stream2, #{'ID' := LeaseId, 'TTL' := TTL}, Rest} ?= Res,
         {ok, TRef} ?= schedule_keepalive(TTL),
         ?LOG_NOTICE("Lease keepalive started for lease ~p with TTL ~p", [LeaseId, TTL]),
@@ -138,7 +138,7 @@ new_request(Client, LeaseId) ->
     maybe
         {ok, Channel} ?= pick_channel(Client),
         {ok, Stream} ?= etcdgun_etcdserverpb_lease_service:lease_keep_alive(Channel),
-        Stream1 = egrpc_stream:send(Stream, #{'ID' => LeaseId}, nofin),
+        Stream1 = egrpc_stream:send_msg(Stream, #{'ID' => LeaseId}, nofin),
         ConnPid = egrpc_stub:conn_pid(Stream),
         MRef = monitor(process, ConnPid),
         case recv_create_response(Client, LeaseId, Stream1, ConnPid, MRef) of

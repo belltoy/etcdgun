@@ -7,9 +7,9 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([
-    init_request/4,
+    init_req/4,
     send_msg/5,
-    recv_msg/4,
+    recv_msg/5,
     parse_msg/4
 ]).
 
@@ -24,7 +24,7 @@
 
 -define(WATCH_CREATE_REQ_CACHE, watch_create_req_cache).
 
-init_request(Stream, Opts, Next, _State) ->
+init_req(Stream, Opts, Next, _State) ->
     Service = egrpc_stream:grpc_service(Stream),
     Method = egrpc_stream:grpc_method(Stream),
     ShouldAuth =
@@ -56,12 +56,12 @@ send_msg(Stream, Req, IsFin, Next, _State) ->
 
 %% Maybe fresh token and retry Watch create request in recv_msg/4 and parse_msg/4.
 %% But what if the request is not the first watch create request in the stream?
-recv_msg(Stream, Acc, Next, _State) ->
-    ?LOG_DEBUG("Receiving message, state: ~p~n", [_State]),
-    Res = Next(Stream, Acc),
+recv_msg(Stream, Timeout, Acc, Next, _State) ->
+    Res = Next(Stream, Timeout, Acc),
     maybe
         'etcdserverpb.Watch' ?= egrpc_stream:grpc_service(Stream),
         'Watch' ?= egrpc_stream:grpc_method(Stream),
+        ?LOG_DEBUG("Received watch response: ~p~n", [Res]),
         {ok, Stream1, Res1, Rest} ?= Res,
         true ?= is_watch_create_failed(Res1),
         true ?= should_refresh_token(Res1),
@@ -101,7 +101,7 @@ is_watch_create_failed(_) -> false.
 refresh_token(Stream) ->
     Channel = egrpc_stream:channel(Stream),
     case egrpc_stub:info(Channel) of
-        #{client := Client} -> etcdgun_client:refresh_token(Client);
+        #{client := Client} when is_atom(Client) -> etcdgun_client:refresh_token(Client);
         _ -> {error, not_a_client}
     end.
 
