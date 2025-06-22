@@ -26,7 +26,7 @@
 -record(watcher, {
     name :: atom(),
     conn_pid :: pid(),
-    stream_ref :: reference(),
+    stream_ref :: gun:stream_ref(),
     monitor_ref :: reference(),
     event_manager_pid :: pid(),
     last_rev :: integer()
