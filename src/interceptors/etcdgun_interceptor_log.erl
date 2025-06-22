@@ -5,6 +5,8 @@
 -export([log/4]).
 
 log(Stream, Request, Opts, Next) ->
+    ?LOG_DEBUG("Logging gRPC request for RPC ~s.~s",
+               [egrpc_stream:grpc_service(Stream), egrpc_stream:grpc_method(Stream)]),
     GrpcType = egrpc_stream:grpc_type(Stream),
     {Duration, Res} = timer:tc(Next, [Stream, Request, Opts]),
     LogData = #{
@@ -19,7 +21,7 @@ log(Stream, Request, Opts, Next) ->
     },
     case Res of
         {ok, _} ->
-            ?LOG_NOTICE(LogData#{msg => "gRPC request successful"});
+            ?LOG_INFO(LogData#{msg => "gRPC request successful"});
         {error, Reason} ->
             ?LOG_ERROR(LogData#{msg => "gRPC request failed", reason => Reason})
     end,
