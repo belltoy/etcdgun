@@ -21,7 +21,7 @@ Opts = #{},
 
 % Now you can use `my_client` to pick channels and call the etcd gRPC APIs.
 {ok, Channel} = etcdgun_client:pick_channel(my_client).
-{ok, #{header := _, members := Members}} = etcdgun_etcdserverpb_cluster_service:member_list(Channel, #{}).
+{ok, #{header := _, members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}).
 ```
 
 ### Client Options

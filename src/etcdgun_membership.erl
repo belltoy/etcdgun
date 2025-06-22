@@ -21,7 +21,7 @@
 
 get_member_list(Channel) ->
     maybe
-        {ok, #{members := Members0}} ?= etcdgun_etcdserverpb_cluster_service:member_list(Channel, #{}),
+        {ok, #{members := Members0}} ?= etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
         Members = [M || #{} = M <- Members0,
                         (L = maps:get(isLearner, M, false)) =/= true,
                         L =/= 1],

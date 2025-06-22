@@ -55,7 +55,7 @@ init({Client, WatcherName, EventHandler, EventHandlerArgs, WatchRequest}) ->
     process_flag(trap_exit, true),
     maybe
         {ok, Channel} ?= etcdgun_client:pick_channel(Client),
-        {ok, Stream} ?= etcdgun_etcdserverpb_watch_service:watch(Channel),
+        {ok, Stream} ?= etcdgun_etcdserverpb_watch_client:watch(Channel),
 
         %% Monitor the gun connection pid.
         ConnPid = egrpc_stub:conn_pid(Stream),

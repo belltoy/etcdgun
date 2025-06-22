@@ -137,7 +137,7 @@ recv_create_response(Client, LeaseId, Stream, ConnPid, MRef) ->
 new_request(Client, LeaseId) ->
     maybe
         {ok, Channel} ?= pick_channel(Client),
-        {ok, Stream} ?= etcdgun_etcdserverpb_lease_service:lease_keep_alive(Channel),
+        {ok, Stream} ?= etcdgun_etcdserverpb_lease_client:lease_keep_alive(Channel),
         Stream1 = egrpc_stream:send_msg(Stream, #{'ID' => LeaseId}, nofin),
         ConnPid = egrpc_stub:conn_pid(Stream),
         MRef = monitor(process, ConnPid),

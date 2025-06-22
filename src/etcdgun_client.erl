@@ -364,7 +364,7 @@ auth(_Channels, undefined) -> {ok, undefined};
 auth([{_MemberId, Channel} | _], {Username, Password}) ->
     maybe
         AuthRequest = #{name => Username, password => Password},
-        {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_service:authenticate(Channel, AuthRequest),
+        {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_client:authenticate(Channel, AuthRequest),
         {ok, Token}
     end.
 
