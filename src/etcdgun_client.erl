@@ -89,6 +89,7 @@ start_link(Client, Endpoints, Options) ->
 %%-------------------------------------------------------------------
 
 init({Client, Endpoints, Opts0}) ->
+    process_flag(trap_exit, true),
     logger:update_process_metadata(#{etcdgun_client => Client}),
     {Cred, Opts} = case maps:take(cred, Opts0) of
                        error -> {undefined, Opts0};
@@ -236,6 +237,9 @@ handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
     erlang:demonitor(MRef, [flush]),
     {noreply, handle_gun_down(GunPid, Reason, State)};
 
+handle_info({check, Result, Elem}, State) ->
+    {noreply, handle_check_result(Result, Elem, State)};
+
 handle_info(Info, State) ->
     ?LOG_WARNING("Received unexpected info message: ~p", [Info]),
     {noreply, State}.
@@ -309,6 +313,8 @@ open_and_wait_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success, Er
         #{clientURLs := [ClientUrl | _]} = Member,
         {ok, Host, Port, _Transport} ?= parse_client_url(ClientUrl),
         {ok, Channel} ?= open_and_wait(Host, Port, Opts#{info => #{client => Client}}),
+        ok ?= check_health(Channel),
+        ok ?= check_leader(Channel),
         GunPid = egrpc_stub:conn_pid(Channel),
         MRef = erlang:monitor(process, GunPid),
         open_and_wait_members(Client, Rest, Opts, [{Id, Channel, MRef} | Success], Errors)
@@ -355,17 +361,31 @@ parse_client_url(ClientUrl) ->
         _ -> {error, invalid_client_url}
     end.
 
+handle_check_result(ok, {MemberId, Channel, _MRef} = Elem, #state{connectings = Connectings} = State) ->
+    ?LOG_INFO("Connection established for etcd member (~s) ~s:~p",
+              [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel)]),
+    State1 = State#state{
+        actives = [Elem | State#state.actives],
+        %% eqwalizer:ignore
+        connectings = lists:delete(Elem, Connectings)
+    },
+    State1;
+handle_check_result({error, Reason}, {MemberId, Channel, _MRef} = Elem,
+                    #state{connectings = Connectings} = State) ->
+    ?LOG_WARNING("Failed to check endpoint for member (~s) ~s:~p, reason: ~p",
+                 [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
+    State1 = State#state{
+        %% eqwalizer:ignore
+        connectings = lists:delete(Elem, Connectings)
+    },
+    State1.
+
 handle_gun_up(GunPid, #state{connectings = Connectings} = State) ->
     case lists:search(fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end, Connectings) of
         {value, {_MemberId, Channel, _MRef} = Elem} ->
-            ?LOG_INFO("Connection established for etcd member ~s:~p",
-                      [egrpc_stub:host(Channel), egrpc_stub:port(Channel)]),
-            State1 = State#state{
-                actives = [Elem | State#state.actives],
-                %% eqwalizer:ignore
-                connectings = lists:delete(Elem, Connectings)
-            },
-            State1;
+            Self = self(),
+            spawn(fun() -> Self ! {check, check_endpoint(Channel), Elem} end),
+            State;
         false ->
             ?LOG_WARNING("Received gun_up for unknown connection: ~p", [GunPid]),
             State
@@ -383,3 +403,36 @@ handle_gun_down(GunPid, Reason, #state{actives = Actives} = State) ->
         false ->
             State
     end.
+
+check_endpoint(Channel) ->
+    maybe
+        ok ?= check_health(Channel),
+        ok ?= check_leader(Channel),
+        ok
+    end.
+
+check_health(Channel) ->
+    case egrpc_grpc_health_v1_health_client:check(Channel, #{}) of
+        {ok, #{status := 'SERVING'}} -> ok;
+        {ok, #{status := 1}} -> ok;
+        {ok, #{status := 'UNKNOWN'}} -> ok;
+        {ok, #{status := 0}} -> ok;
+        {ok, #{status := Status}} -> {error, {unhealthy, Status}};
+        {error, Reason} -> {error, Reason}
+    end.
+
+check_leader(Channel) ->
+    case etcdgun_etcdserverpb_maintenance_client:status(Channel, #{}) of
+        {ok, #{leader := 0}} -> {error, no_leader};
+        {ok, #{leader := LeaderId, errors := Errors}} when LeaderId > 0 ->
+            case length(Errors) of
+                0 -> ok;
+                _ ->
+                    ?LOG_WARNING("Errors reported by etcd server: ~s", [lists:join("; ", Errors)])
+            end,
+            ok;
+        {error, Reason} -> {error, Reason}
+    end.
+
+hex(I) when is_integer(I) ->
+    string:lowercase(binary:encode_hex(<<I:64>>)).
