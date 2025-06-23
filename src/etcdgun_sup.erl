@@ -49,4 +49,4 @@ init([]) ->
         type => supervisor,
         modules => [etcdgun_event_manager_sup]
     },
-    {ok, {SupFlags, [ClientSup, LeaseKeepaliveSup, EventManagerSup, WatcherSup]}}.
+    {ok, {SupFlags, [ClientSup, EventManagerSup, LeaseKeepaliveSup, WatcherSup]}}.
