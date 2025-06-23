@@ -3,12 +3,24 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
 ## Features
 
 - [x] etcd v3 gRPC APIs.
-- [x] unary and streaming interceptors for more flexible needs.
+    - `etcdserverpb.KV`
+    - `etcdserverpb.Watch`
+    - `etcdserverpb.Lease`
+    - `etcdserverpb.Auth`
+    - `etcdserverpb.Cluster`
+    - `etcdserverpb.Maintenance`
+- [x] etcd v3 concurrency gRPC APIs.
+    - `v3electionpb.Election`
+    - `v3lockpb.Lock`
+- [x] gRPC health v1 API (via [`egrpc`](https://github.com/belltoy/grpc))
+- [x] unary and streaming [interceptors](src/interceptors/) for more flexible needs.
 - [x] etcd authentication and auto-token-refreshing.
-- [x] lease keep alive.
-- [x] watch with auto-reconnect.
-- [x] etcd member list
-- [ ] etcd endpoints health check.
+- [x] lease keep alive [`etcdgun_lease_keepalive`](src/etcdgun_lease_keepalive.erl).
+- [x] watcher with auto-reconnect [`etcdgun_watcher`](src/etcdgun_watcher.erl).
+- [x] auth-check etcd member list [`etcdgun_membership`](src/etcdgun_membership.erl).
+- [x] etcd endpoints health check when dial.
+- [ ] health check for active channels in interval.
+- [ ] idle connection keep alive?
 
 ## Client APIs
 
@@ -22,6 +34,8 @@ Opts = #{},
 % Now you can use `my_client` to pick channels and call the etcd gRPC APIs.
 {ok, Channel} = etcdgun_client:pick_channel(my_client).
 {ok, #{header := _, members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}).
+
+{ok,#{status => 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}).
 ```
 
 ### Client Options
@@ -40,5 +54,5 @@ Support unary interceptors and streaming interceptors.
 rebar3 protobuf compile
 
 # Generate the etcd gRPC client code
-rebar3 etcdgun gen
+rebar3 egrpc gen
 ```
