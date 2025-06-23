@@ -41,12 +41,12 @@ init([]) ->
         type => supervisor,
         modules => [etcdgun_watcher_sup]
     },
-    WatcherManager = #{
-        id => etcdgun_watcher_manager,
-        start => {etcdgun_watcher_manager, start_link, []},
+    EventManagerSup = #{
+        id => etcdgun_event_manager_sup,
+        start => {etcdgun_event_manager_sup, start_link, []},
         restart => permanent,
-        shutdown => 5000,
-        type => worker,
-        modules => [etcdgun_watcher_manager]
+        shutdown => infinity,
+        type => supervisor,
+        modules => [etcdgun_event_manager_sup]
     },
-    {ok, {SupFlags, [ClientSup, LeaseKeepaliveSup, WatcherManager, WatcherSup]}}.
+    {ok, {SupFlags, [ClientSup, LeaseKeepaliveSup, EventManagerSup, WatcherSup]}}.

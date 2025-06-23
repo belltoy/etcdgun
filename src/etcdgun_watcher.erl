@@ -7,8 +7,8 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([
-    start_link/5,
-    cancel/1
+    create_watch_cache_table/0,
+    start_link/4
 ]).
 
 -export([
@@ -28,8 +28,9 @@
     monitor_ref :: reference(),
     conn_pid :: pid(),
     event_manager_pid = undefined :: undefined | pid(),
-    watch_id :: integer(),
-    % retry_ref :: undefined | reference(),
+    create_ref = undefined :: undefined | reference(),
+    creatings = [] :: [WatchId :: integer()],
+    watches = #{} :: #{WatchId :: integer() => Revision :: integer()},
     buf = <<>> :: binary()
 }).
 
@@ -37,20 +38,34 @@
 -define(WATCH_EVENT_CANCELED, watch_canceled).
 -define(WATCH_EVENT_STOPPED(Reason), {watch_stopped, Reason}).
 
+-define(WATCH_CACHE_TABLE, etcdgun_watcher_cache).
+
+-record(watcher_cache, {
+    watcher_name :: atom(),
+    last_revisions :: #{WatchId :: integer() => Revision :: integer()}
+}).
+
 %% TODO: Timeout, invalid auth token, reconnect, etc.
 
-start_link(Client, WatcherName, EventHandler, EventHandlerArgs, WatchRequest) ->
-    Args = {Client, WatcherName, EventHandler, EventHandlerArgs, WatchRequest},
-    gen_server:start_link({local, WatcherName}, ?MODULE, Args, []).
+create_watch_cache_table() ->
+    case ets:info(?WATCH_CACHE_TABLE) of
+        undefined ->
+            ets:new(?WATCH_CACHE_TABLE,
+                [set, named_table, public,
+                 {keypos, #watcher_cache.watcher_name},
+                 {read_concurrency, true}]);
+        _Info -> ok
+    end.
 
-cancel(Pid) ->
-    gen_server:stop(Pid, {shutdown, cancel_watch}, infinity).
+start_link(Client, WatcherName, EventMgr, WatchRequests) ->
+    Args = {Client, WatcherName, EventMgr, WatchRequests},
+    gen_server:start_link({local, WatcherName}, ?MODULE, Args, []).
 
 %%-------------------------------------------------------------------
 %% gen_server callbacks
 %%-------------------------------------------------------------------
 
-init({Client, WatcherName, EventHandler, EventHandlerArgs, WatchRequest}) ->
+init({Client, WatcherName, EventMgr, WatchRequests}) ->
     ?LOG_INFO("Starting watcher ~p for client ~p", [WatcherName, Client]),
     process_flag(trap_exit, true),
     maybe
@@ -61,32 +76,31 @@ init({Client, WatcherName, EventHandler, EventHandlerArgs, WatchRequest}) ->
         ConnPid = egrpc_stub:conn_pid(Stream),
         MRef = erlang:monitor(process, ConnPid),
 
+        WatchRequests1 = assign_watch_id(WatchRequests),
         %% Try to load last revision if the watcher is being restarted.
-        WatchRequest1 = load_lasst_revision(WatcherName, WatchRequest),
+        WatchRequests2 = load_lasst_revision(WatcherName, WatchRequests1),
         %% Send the create request.
-        Stream1 = egrpc_stream:send_msg(Stream, WatchRequest1, nofin),
+        % Stream1 = egrpc_stream:send_msg(Stream, WatchRequests1, nofin),
+        Stream1 = send_watch_requests(Stream, WatchRequests2),
 
         %% Receive the response header
         {ok, Stream2} ?= recv_response_header(Stream1, 5000),
-        %% Receive the first reponse msg and check if the watcher was created successfully.
-        {ok, Stream3, #{header := #{revision := Rev}, watch_id := WatchId}, Rest}
-            ?= case recv_create_watch_response(Stream2, 5000, <<>>) of
-                   {error, {create_error, Reason}} ->
-                       {error, {create_error, Reason}};
-                   Other -> Other
-               end,
-        ?LOG_INFO("Watcher ~p created with ID ~p, revision ~p", [WatcherName, WatchId, Rev]),
+
+        TRef = erlang:start_timer(5000, self(), create_watch_timeout),
+        WatchIds = [I || #{request_union := {create_request, #{watch_id := I}}} <- WatchRequests1],
         State = #state{
             client = Client,
             watcher_name = WatcherName,
-            stream = Stream3,
-            stream_ref = egrpc_stream:stream_ref(Stream3),
+            stream = Stream2,
+            stream_ref = egrpc_stream:stream_ref(Stream2),
             monitor_ref = MRef,
             conn_pid = ConnPid,
-            watch_id = WatchId,
-            buf = Rest
+            event_manager_pid = EventMgr,
+            create_ref = TRef,
+            creatings = WatchIds,
+            buf = <<>>
         },
-        {ok, State, {continue, {register_event_manager, EventHandler, EventHandlerArgs, Rev}}}
+        {ok, State}
     else
         {error, Reason3} ->
             ?LOG_ERROR("Failed to start watcher: ~p", [Reason3]),
@@ -99,6 +113,13 @@ handle_call(_Request, _From, State) ->
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
+
+handle_info({timeout, TRef, create_watch_timeout},
+            #state{create_ref = TRef, creatings = []} = State) ->
+    {noreply, State#state{create_ref = undefined}};
+handle_info({timeout, TRef, create_watch_timeout},
+            #state{create_ref = TRef} = State) ->
+    {stop, {create_error, timeout}, State#state{create_ref = undefined}};
 
 handle_info({gun_data, _ConnPid, StreamRef, nofin, Data},
             #state{stream_ref = StreamRef, buf = Buf} = State) ->
@@ -126,20 +147,6 @@ handle_info(Info, State) ->
     ?LOG_WARNING("Unexpected info: ~p", [Info]),
     {noreply, State}.
 
-handle_continue(
-    {register_event_manager, EventHandler, EventHandlerArgs, Rev},
-    #state{watcher_name = WatcherName, conn_pid = ConnPid, stream_ref = StreamRef} = State
-) ->
-    case register_watcher(WatcherName, ConnPid, StreamRef,
-                          EventHandler, EventHandlerArgs, Rev) of
-        {ok, EventManagerPid} ->
-            ?LOG_INFO("Watcher ~p registered with event manager ~p",
-                      [WatcherName, EventManagerPid]),
-            {noreply, State#state{event_manager_pid = EventManagerPid}};
-        {error, Reason} ->
-            ?LOG_ERROR("Failed to register watcher ~p: ~p", [WatcherName, Reason]),
-            {stop, {register_event_manager_failed, Reason}, State}
-    end;
 handle_continue(process_data, #state{buf = Buf, stream = Stream} = State) ->
     case egrpc_stream:parse_msg(Stream, Buf) of
         more -> {noreply, State};
@@ -148,9 +155,14 @@ handle_continue(process_data, #state{buf = Buf, stream = Stream} = State) ->
     end.
 
 terminate(Reason, State) ->
-    is_normal(Reason) andalso ?LOG_INFO("Watcher terminating: ~p", [Reason]),
-    is_normal(Reason) orelse ?LOG_WARNING("Watcher terminating: ~p", [Reason]),
-    is_normal(Reason) andalso cancel_watch(State),
+    case is_normal(Reason) of
+        true ->
+            ?LOG_INFO("Watcher terminating: ~p", [Reason]),
+            etcdgun_event_manager_sup:stop_event_manager(State#state.event_manager_pid);
+        false ->
+            ?LOG_WARNING("Watcher terminating: ~p", [Reason])
+    end,
+    % is_normal(Reason) andalso cancel_watches(State),
 	erlang:demonitor(State#state.monitor_ref, [flush]),
     cancel_stream(State),
     notify(?WATCH_EVENT_STOPPED(Reason), State),
@@ -165,6 +177,13 @@ is_normal(shutdown) -> true;
 is_normal({shutdown, _}) -> true;
 is_normal(_) -> false.
 
+send_watch_requests(Stream, []) -> Stream;
+send_watch_requests(Stream, [Req | Rest]) ->
+    %% Send the create request.
+    ?LOG_DEBUG("Sending watch request: ~p", [Req]),
+    Stream1 = egrpc_stream:send_msg(Stream, Req, nofin),
+    send_watch_requests(Stream1, Rest).
+
 recv_response_header(Stream, Timeout) ->
     Res = egrpc_stream:recv_header(Stream, Timeout),
     case Res of
@@ -174,42 +193,31 @@ recv_response_header(Stream, Timeout) ->
     end,
     Res.
 
-recv_create_watch_response(Stream, Timeout, Acc) ->
-    Res = case egrpc_stream:recv_msg(Stream, Timeout, Acc) of
-              {ok, _Stream1, _, _Rest} = R -> R;
-              {error, Reason} ->
-                  ?LOG_ERROR("Failed to receive response header: ~p", [Reason]),
-                  {error, Reason}
-          end,
-    erlang:element(1, Res) =/= ok andalso egrpc_stream:cancel_stream(Stream),
-    Res.
-
-cancel_watch(#state{stream = Stream} = State) ->
-    CancelRequest = #{request_union =>
-                      {cancel_request, #{watch_id => State#state.watch_id}}
-                     },
-    Stream1 = egrpc_stream:send_msg(Stream, CancelRequest, nofin),
-    Stream2 = egrpc_stream:close_send(Stream1),
-    await_cancel_response(update_stream(Stream2, State)).
-
-await_cancel_response(#state{buf = Buf, stream = Stream} = State) ->
+process_response(#{created := true,
+                   canceled := false,
+                   watch_id := WatchId, header := #{revision := Rev}} = Response,
+                 #state{creatings = Creatings, watches = Watches} = State) ->
     maybe
-        {ok, Stream1, Msg, Rest} ?= egrpc_stream:recv_msg(Stream, 5000, Buf),
-        case process_response(Msg, update_stream(Stream1, State#state{buf = Rest})) of
-            {noreply, State1, {continue, process_data}} ->
-                await_cancel_response(State1);
-            {stop, {shutdown, canceled}, _State1} ->
-                ok
-        end
-    end.
-
+        true ?= lists:member(WatchId, State#state.creatings),
+        ?LOG_INFO("Watcher ~p created watch with ID ~p, revision ~p",
+                  [State#state.watcher_name, WatchId, Rev]),
+        Rest = Creatings -- [WatchId],
+        length(Rest) =:= 0 andalso ?LOG_INFO("All watches created for watcher ~p",
+                                             [State#state.watcher_name]),
+        {noreply, State#state{creatings = Rest, watches = Watches#{WatchId => Rev}}}
+    else
+        _ ->
+            ?LOG_WARNING("Watcher ~p received unexpected create response: ~p",
+                      [State#state.watcher_name, Response]),
+            {noreply, State}
+    end;
 process_response(#{created := false, canceled := false, events := Events} = Response, State) ->
-    #{header := #{revision := LastRev}} = Response,
-    true = etcdgun_watcher_manager:update_last_revision(State#state.watcher_name, LastRev),
+    #{watch_id := WatchId, header := #{revision := LastRev}} = Response,
     notify(?WATCH_EVENT_EVENTS(Events), State),
+    update_last_revision(State#state.watcher_name, WatchId, LastRev),
     {noreply, State, {continue, process_data}};
-process_response(#{created := false, canceled := true}, State) ->
-    notify(?WATCH_EVENT_CANCELED, State),
+process_response(#{created := false, canceled := true, watch_id := WatchId}, State) ->
+    notify({?WATCH_EVENT_CANCELED, WatchId}, State),
     {stop, {shutdown, canceled}, State}.
 
 notify(Event, #state{event_manager_pid = Pid}) when is_pid(Pid) ->
@@ -221,22 +229,38 @@ cancel_stream(State) ->
 update_stream(Stream, #state{} = State) ->
     State#state{stream = Stream, stream_ref = egrpc_stream:stream_ref(Stream)}.
 
-load_lasst_revision(WatcherName,
-                    #{request_union := {create_request, WatchCreateRequest}} = WatchRequest) ->
-    StartRevision0 = maps:get(start_revision, WatchCreateRequest, 0),
-    StartRevision = case etcdgun_watcher_manager:last_revision(WatcherName) of
-                        undefined -> StartRevision0;
-                        LastRev -> LastRev + 1
-                    end,
-    WatchCreateRequest1 = WatchCreateRequest#{start_revision => StartRevision},
-    WatchRequest#{request_union => {create_request, WatchCreateRequest1}}.
+assign_watch_id(WatchRequests) ->
+    lists:map(
+        fun({WatchId, #{request_union := {create_request, Req}}}) when is_map(Req) ->
+                Req1 = Req#{watch_id => WatchId},
+                #{request_union => {create_request, Req1}}
+        end, lists:enumerate(WatchRequests)).
 
-register_watcher(WatcherName, ConnPid, StreamRef, EventHandler, EventHandlerArgs, Rev) ->
-    Res = etcdgun_watcher_manager:register_watcher(WatcherName, ConnPid, StreamRef,
-                                                   EventHandler, EventHandlerArgs, Rev),
-    case Res of
-        {ok, _} = Ok -> Ok;
-        {error, _Reason} = E ->
-            gun:cancel(ConnPid, StreamRef),
-            E
-    end.
+% If the watcher was previously registered, we can start from the last revision.
+% This is useful for resuming watches after a disconnect.
+load_lasst_revision(WatcherName, WatchRequests) ->
+    LastRevisions = case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
+                        [] -> #{};
+                        [#watcher_cache{last_revisions = LastRevisions0}] -> LastRevisions0
+                    end,
+    lists:map(
+        fun(#{request_union := {create_request, #{watch_id := WatchId} = Req}} = Req0) ->
+                case maps:get(WatchId, LastRevisions, undefined) of
+                    undefined -> Req0;
+                    LastRevision ->
+                        Req1 = Req#{start_revision => LastRevision + 1},
+                        #{request_union => {create_request, Req1}}
+                end
+        end, WatchRequests).
+
+update_last_revision(WatcherName, WatchId, LastRev) ->
+    case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
+        [] ->
+            Cache = #watcher_cache{watcher_name = WatcherName,
+                                   last_revisions = #{WatchId => LastRev}},
+            ets:insert(?WATCH_CACHE_TABLE, Cache);
+        [#watcher_cache{last_revisions = LastRevisions} = Cache] ->
+            NewLastRevisions = LastRevisions#{WatchId => LastRev},
+            ets:insert(?WATCH_CACHE_TABLE, Cache#watcher_cache{last_revisions = NewLastRevisions})
+    end,
+    ok.

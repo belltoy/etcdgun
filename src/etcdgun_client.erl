@@ -37,8 +37,8 @@
 -record(state, {
     name :: atom(),
     members :: #{member_id() => member()},
-    actives :: [{member_id(), egrpc:channel()}],
-    connectings = [] :: [{member_id(), egrpc:channel()}],
+    actives :: [{member_id(), egrpc:channel(), MonitorRef ::reference()}],
+    connectings = [] :: [{member_id(), egrpc:channel(), MonitorRef ::reference()}],
     retry_tref = undefined :: undefined | reference(),
     token = undefined :: binary() | undefined,
     cred = undefined :: {binary(), binary()} | undefined
@@ -115,7 +115,7 @@ init({Client, Endpoints, Opts0}) ->
             name = Client,
             %% elp:ignore W0036
             members = maps:from_list([{Id, M} || #{'ID' := Id} = M <- Members]),
-            actives = Actives,
+            actives = shuffle(Actives),
             token = Token,
             cred = Cred
         },
@@ -157,7 +157,7 @@ handle_call(refresh_token, _From, #state{cred = {Username, Password}} = State) -
 handle_call(pick_channel, _From, #state{actives = []} = State) ->
     {reply, {error, no_available_connection}, State};
 
-handle_call(pick_channel, _From, #state{actives = [{_M, Channel} = P | Rest]} = State) ->
+handle_call(pick_channel, _From, #state{actives = [{_M, Channel, _MRef} = P | Rest]} = State) ->
     Info1 = case {State#state.token, egrpc_stub:info(Channel, #{})} of
                 {undefined, Info} -> Info;
                 {Token, #{} = Info} -> Info#{token => Token}
@@ -204,9 +204,9 @@ handle_cast({sync_membership, NewMembers}, #state{members = OldMembers} = State)
     ToAdds = maps:without(maps:keys(Unchanged1), NewMembersMap),
 
     {ToRemoveActives, Actives1} = lists:partition(
-        fun({Id, _Channel}) -> is_map_key(Id, ToRemovesMap) end, State#state.actives),
+        fun({Id, _Channel, _MRef}) -> is_map_key(Id, ToRemovesMap) end, State#state.actives),
     {ToRemoveConnectings, Connectings1} = lists:partition(
-        fun({Id, _Channel}) -> is_map_key(Id, ToRemovesMap) end, State#state.connectings),
+        fun({Id, _Channel, _MRef}) -> is_map_key(Id, ToRemovesMap) end, State#state.connectings),
 
     length(ToRemoves) > 0 andalso ?LOG_INFO("Removing etcd members: ~p",
                                               [maps:values(ToRemovesMap)]),
@@ -227,36 +227,14 @@ handle_cast(_Msg, State) ->
 handle_info({timeout, TRef, retry}, #state{retry_tref = TRef} = State) ->
     {noreply, State#state{retry_tref = undefined}, {continue, do_retry}};
 
-handle_info({gun_down, ConnPid, http2, Reason, _Streams},
-            #state{actives = Actives} = State) ->
-    case lists:search(fun({_M, C}) -> egrpc_stub:conn_pid(C) =:= ConnPid end, Actives) of
-        {value, {_MemberId, Channel} = Elem} ->
-            ?LOG_WARNING("Connection down for member ~s:~p, reason: ~p",
-                         [egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
-            egrpc_stub:close(Channel),
-            {noreply, State#state{
-                %% eqwalizer:ignore
-                actives = lists:delete(Elem, Actives)
-            }};
-        false ->
-            {noreply, State}
-    end;
-
-handle_info({gun_up, ConnPid, http2}, #state{connectings = Connectings} = State) ->
-    case lists:search(fun({_M, C}) -> egrpc_stub:conn_pid(C) =:= ConnPid end, Connectings) of
-        {value, {_MemberId, Channel} = Elem} ->
-            ?LOG_INFO("Connection established for etcd member ~s:~p",
-                      [egrpc_stub:host(Channel), egrpc_stub:port(Channel)]),
-            State1 = State#state{
-                actives = [Elem | State#state.actives],
-                %% eqwalizer:ignore
-                connectings = lists:delete(Elem, Connectings)
-            },
-            {noreply, State1};
-        false ->
-            ?LOG_WARNING("Received gun_up for unknown connection: ~p", [ConnPid]),
-            {noreply, State}
-    end;
+handle_info({gun_up, GunPid, http2}, State) ->
+    %% TODO: check if the connected node is healthy
+    {noreply, handle_gun_up(GunPid, State)};
+handle_info({gun_down, GunPid, http2, Reason, _Streams}, State) ->
+    {noreply, handle_gun_down(GunPid, Reason, State)};
+handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
+    erlang:demonitor(MRef, [flush]),
+    {noreply, handle_gun_down(GunPid, Reason, State)};
 
 handle_info(Info, State) ->
     ?LOG_WARNING("Received unexpected info message: ~p", [Info]),
@@ -264,8 +242,8 @@ handle_info(Info, State) ->
 
 handle_continue(do_retry, #state{connectings = OldConnectings} = State) ->
     cancel_retry_timer(State),
-    Retries0 = maps:keys(State#state.members) -- [Id || {Id, _} <- State#state.actives],
-    Retries = Retries0 -- [Id || {Id, _} <- State#state.connectings],
+    Retries0 = maps:keys(State#state.members) -- [Id || {Id, _, _MRef} <- State#state.actives],
+    Retries = Retries0 -- [Id || {Id, _, _MRef} <- State#state.connectings],
 
     Connectings =
         case length(Retries) > 0 of
@@ -281,12 +259,15 @@ handle_continue(do_retry, #state{connectings = OldConnectings} = State) ->
 
 terminate(_Reason, #state{actives = Actives, connectings = Connectings} = _State) ->
     ?LOG_NOTICE("Terminating etcdgun client, reason: ~p", [_Reason]),
-    [egrpc_stub:close(Channel) || {_Id, Channel} <- Actives ++ Connectings],
+    [ensure_close(Conn) || {_Id, _Channel, _MRef} = Conn <- Actives ++ Connectings],
     ok.
 
 %%-------------------------------------------------------------------
 %% Private functions
 %%-------------------------------------------------------------------
+ensure_close({_Id, Channel, MRef}) ->
+    erlang:demonitor(MRef, [flush]),
+    egrpc_stub:close(Channel).
 
 shuffle(List) ->
     [X || {_, X} <- lists:sort([{rand:uniform(), N} || N <- List])].
@@ -328,7 +309,9 @@ open_and_wait_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success, Er
         #{clientURLs := [ClientUrl | _]} = Member,
         {ok, Host, Port, _Transport} ?= parse_client_url(ClientUrl),
         {ok, Channel} ?= open_and_wait(Host, Port, Opts#{info => #{client => Client}}),
-        open_and_wait_members(Client, Rest, Opts, [{Id, Channel} | Success], Errors)
+        GunPid = egrpc_stub:conn_pid(Channel),
+        MRef = erlang:monitor(process, GunPid),
+        open_and_wait_members(Client, Rest, Opts, [{Id, Channel, MRef} | Success], Errors)
     else
         {error, Reason} ->
             ?LOG_WARNING(#{msg =>"Failed to connect to etcd member",
@@ -339,29 +322,22 @@ open_and_wait_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success, Er
 
 open_and_wait(Host, Port, Opts) ->
     maybe
-        {ok, Channel} ?= egrpc_stub:open(Host, Port, Opts),
+        {ok, Channel} ?= egrpc_stub:open(Host, Port, Opts#{}),
         egrpc_stub:await_up(Channel)
     end.
 
 open_members(_Client, [], _Opts, Result) -> Result;
-open_members(Client, [#{'ID' := Id} = Member | Rest], Opts0, Success) ->
+open_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success) ->
     #{clientURLs := [ClientUrl | _]} = Member,
-    GunOpts0 = maps:get(gun_opts, Opts0, #{}),
-    GunOpts1 = GunOpts0#{retry => 1, retry_fun => fun retry_fun/2},
-    Opts = Opts0#{gun_opts => GunOpts1},
     maybe
         {ok, Host, Port, _Transport} ?= parse_client_url(ClientUrl),
         {ok, Channel} ?= egrpc_stub:open(Host, Port, Opts#{info => #{client => Client}}),
-        open_members(Client, Rest, Opts, [{Id, Channel} | Success])
+        MRef = erlang:monitor(process, egrpc_stub:conn_pid(Channel)),
+        open_members(Client, Rest, Opts, [{Id, Channel, MRef} | Success])
     end.
 
-retry_fun(_Retries, _Opts) ->
-    %% Alwasy return retries 1 means that we want gun retry to connect forever, until
-    %% the member is removed from the cluster.
-    #{retries => 1, timeout => 5000}.
-
 auth(_Channels, undefined) -> {ok, undefined};
-auth([{_MemberId, Channel} | _], {Username, Password}) ->
+auth([{_MemberId, Channel, _MRef} | _], {Username, Password}) ->
     maybe
         AuthRequest = #{name => Username, password => Password},
         {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_client:authenticate(Channel, AuthRequest),
@@ -377,4 +353,33 @@ parse_client_url(ClientUrl) ->
         {ok, Host, Port, Transport}
     else
         _ -> {error, invalid_client_url}
+    end.
+
+handle_gun_up(GunPid, #state{connectings = Connectings} = State) ->
+    case lists:search(fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end, Connectings) of
+        {value, {_MemberId, Channel, _MRef} = Elem} ->
+            ?LOG_INFO("Connection established for etcd member ~s:~p",
+                      [egrpc_stub:host(Channel), egrpc_stub:port(Channel)]),
+            State1 = State#state{
+                actives = [Elem | State#state.actives],
+                %% eqwalizer:ignore
+                connectings = lists:delete(Elem, Connectings)
+            },
+            State1;
+        false ->
+            ?LOG_WARNING("Received gun_up for unknown connection: ~p", [GunPid]),
+            State
+    end.
+
+handle_gun_down(GunPid, Reason, #state{actives = Actives} = State) ->
+    case lists:search(fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end, Actives) of
+        {value, {_MemberId, Channel, MRef} = Elem} ->
+            ?LOG_WARNING("Connection down for member ~s:~p, reason: ~p",
+                         [egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
+            erlang:demonitor(MRef, [flush]),
+            egrpc_stub:close(Channel),
+            %% eqwalizer:ignore
+            State#state{actives = lists:delete(Elem, Actives)};
+        false ->
+            State
     end.

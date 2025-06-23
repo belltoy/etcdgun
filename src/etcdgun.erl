@@ -4,7 +4,9 @@
     clients/0,
     open/2,
     open/3,
-    close/1
+    close/1,
+    watch/5,
+    cancel_watch/2
 ]).
 
 -export_type([
@@ -39,3 +41,9 @@ open(Client, Endpoints, Opts) ->
 
 close(Client) ->
     etcdgun_client_sup:stop_child(Client).
+
+watch(Client, WatcherName, EventHandler, EventHandlerArgs, Requests) ->
+    etcdgun_watcher_sup:start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Requests).
+
+cancel_watch(Client, WatcherName) ->
+    etcdgun_watcher_sup:stop_child(Client, WatcherName).
