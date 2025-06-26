@@ -345,8 +345,8 @@ open_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success) ->
 auth(_Channels, undefined) -> {ok, undefined};
 auth([{_MemberId, Channel, _MRef} | _], {Username, Password}) ->
     maybe
-        AuthRequest = #{name => Username, password => Password},
-        {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_client:authenticate(Channel, AuthRequest),
+        Req = #{name => Username, password => Password},
+        {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_client:authenticate(Channel, Req),
         {ok, Token}
     end.
 
@@ -361,24 +361,25 @@ parse_client_url(ClientUrl) ->
         _ -> {error, invalid_client_url}
     end.
 
-handle_check_result(ok, {MemberId, Channel, _MRef} = Elem, #state{connectings = Connectings} = State) ->
-    ?LOG_INFO("Connection established for etcd member (~s) ~s:~p",
-              [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel)]),
-    State1 = State#state{
-        actives = [Elem | State#state.actives],
-        %% eqwalizer:ignore
-        connectings = lists:delete(Elem, Connectings)
-    },
-    State1;
-handle_check_result({error, Reason}, {MemberId, Channel, _MRef} = Elem,
+handle_check_result(Result, {MemberId, Channel, MRef} = Elem,
                     #state{connectings = Connectings} = State) ->
-    ?LOG_WARNING("Failed to check endpoint for member (~s) ~s:~p, reason: ~p",
-                 [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
-    State1 = State#state{
-        %% eqwalizer:ignore
-        connectings = lists:delete(Elem, Connectings)
-    },
-    State1.
+    maybe
+        {value, {MemberId, Channel, MRef}, Rest} ?= lists:keytake(MemberId, 1, Connectings),
+        State1 = State#state{connectings = Rest},
+        {ok, _} ?= {Result, State1},
+        ?LOG_INFO("Connection established for etcd member (~s) ~s:~p",
+                  [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel)]),
+        State1#state{actives = [Elem | State#state.actives]}
+    else
+        {{error, Reason}, State2} ->
+            ?LOG_WARNING("Failed to check endpoint for member (~s) ~s:~p, reason: ~p",
+                         [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel),
+                          Reason]),
+            State2;
+        false ->
+            ?LOG_WARNING("Received check result for unknown connection: ~p", [Elem]),
+            State
+    end.
 
 handle_gun_up(GunPid, #state{connectings = Connectings} = State) ->
     case lists:search(fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end, Connectings) of
