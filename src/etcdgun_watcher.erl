@@ -156,11 +156,8 @@ handle_continue(process_data, #state{buf = Buf, stream = Stream} = State) ->
 
 terminate(Reason, State) ->
     case is_normal(Reason) of
-        true ->
-            ?LOG_INFO("Watcher terminating: ~p", [Reason]),
-            etcdgun_event_manager_sup:stop_event_manager(State#state.event_manager_pid);
-        false ->
-            ?LOG_WARNING("Watcher terminating: ~p", [Reason])
+        true -> ?LOG_INFO("Watcher terminating: ~p", [Reason]);
+        false -> ?LOG_WARNING("Watcher terminating: ~p", [Reason])
     end,
     % is_normal(Reason) andalso cancel_watches(State),
 	erlang:demonitor(State#state.monitor_ref, [flush]),

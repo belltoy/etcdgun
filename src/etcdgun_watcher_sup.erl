@@ -6,6 +6,9 @@
 
 -export([start_child/5, stop_child/2]).
 
+-define(WATCHER_EVENT_MANAGER, etcdgun_event_manager_table).
+-record(watcher_event_manager, {id , event_manager_pid}).
+
 start_link() ->
     etcdgun_watcher:create_watch_cache_table(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
@@ -26,7 +29,13 @@ start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Requests) ->
                     modules => [etcdgun_watcher]
                 },
                 case supervisor:start_child(?MODULE, Child) of
-                    {ok, Pid} when is_pid(Pid) -> {ok, Pid};
+                    {ok, Pid} when is_pid(Pid) ->
+                        Record = #watcher_event_manager{
+                            id = {Client, WatcherName},
+                            event_manager_pid = EventMgr
+                        },
+                        ets:insert(?WATCHER_EVENT_MANAGER, Record),
+                        {ok, Pid};
                     {error, Reason} -> error(Reason)
                 end;
             {'EXIT', Reason} ->
@@ -44,11 +53,25 @@ start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Requests) ->
 stop_child(Client, WatcherName) ->
     case supervisor:terminate_child(?MODULE, {Client, WatcherName}) of
         ok ->
-            ok = supervisor:delete_child(?MODULE, {Client, WatcherName});
+            ok = supervisor:delete_child(?MODULE, {Client, WatcherName}),
+            case ets:lookup(?WATCHER_EVENT_MANAGER, {Client, WatcherName}) of
+                [#watcher_event_manager{event_manager_pid = EventMgr} = Record] ->
+                    ets:delete_object(?WATCHER_EVENT_MANAGER, Record),
+                    ok = etcdgun_event_manager_sup:stop_event_manager(EventMgr),
+                    ok;
+                [] -> ok
+            end,
+            ok;
         {error, not_found} = E -> E
     end.
 
 init([]) ->
+    case ets:info(?WATCHER_EVENT_MANAGER) of
+        undefined ->
+            ets:new(?WATCHER_EVENT_MANAGER,
+                    [named_table, public, set, {keypos, #watcher_event_manager.id}]);
+        _ -> ok
+    end,
     MaxRestarts = 300,
     MaxSecondsBetweenRestarts = 10,
     SupFlags = #{
