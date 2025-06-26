@@ -22,6 +22,11 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
 - [ ] health check for active channels in interval.
 - [ ] idle connection keep alive?
 
+Generating etcd v3 API codes via the proto files in etcd v3.5.10, without changing their packets.
+
+Extract `ResponseHeader` from `rpc.proto` into `response_header.proto` to avoid [gpb](https://hex.pm/packages/gpb) to generate the
+same structure in multiple output pb modules.
+
 ## Client APIs
 
 ### Starting Client
