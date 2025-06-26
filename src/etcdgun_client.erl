@@ -40,11 +40,14 @@
     actives :: [{member_id(), egrpc:channel(), MonitorRef ::reference()}],
     connectings = [] :: [{member_id(), egrpc:channel(), MonitorRef ::reference()}],
     retry_tref = undefined :: undefined | reference(),
+    membership_tref = undefined :: undefined | reference(),
+    membership_check_interval :: timeout(), %% 5 minutes
     token = undefined :: binary() | undefined,
     cred = undefined :: {binary(), binary()} | undefined
 }).
 
 -define(RETRY_INTERVAL, 5000).
+-define(MEMBERSHIP_CHECK_INTERVAL, 300_000). % 5 minutes
 
 client_info(Client) ->
     gen_server:call(Client, client_info).
@@ -67,14 +70,14 @@ refresh_token(Client) ->
     % eqwalizer:ignore
     gen_server:call(Client, refresh_token).
 
--spec pick_channel(etcdgun:client()) ->
+-spec pick_channel(etcdgun:client() | pid()) ->
     {ok, egrpc:channel()} |
     {error, no_available_connection | term()}.
 pick_channel(Client) ->
     %% eqwalizer:ignore
     gen_server:call(Client, pick_channel).
 
--spec sync_membership(etcdgun:client(), [etcdgun_rpc_pb:'etcdserverpb.Member'()]) -> ok.
+-spec sync_membership(etcdgun:client() | pid(), [etcdgun_rpc_pb:'etcdserverpb.Member'()]) -> ok.
 sync_membership(Client, Members) ->
     gen_server:cast(Client, {sync_membership, Members}).
 
@@ -91,10 +94,20 @@ start_link(Client, Endpoints, Options) ->
 init({Client, Endpoints, Opts0}) ->
     process_flag(trap_exit, true),
     logger:update_process_metadata(#{etcdgun_client => Client}),
-    {Cred, Opts} = case maps:take(cred, Opts0) of
-                       error -> {undefined, Opts0};
-                       {Cred0, Rest} -> {Cred0, Rest}
-                   end,
+    Cred =
+        case maps:get(cred, Opts0, undefined) of
+            {Username, Password} when is_list(Username), is_list(Password),
+                                      length(Username) > 0, length(Password) >0 ->
+                {Username, Password};
+            _ -> undefined
+        end,
+    MembershipCheckInterval =
+        case maps:get(membership_check_interval, Opts0, ?MEMBERSHIP_CHECK_INTERVAL) of
+            I when is_integer(I) andalso I >= 0 -> I;
+            infinity -> infinity;
+            _ -> ?MEMBERSHIP_CHECK_INTERVAL
+        end,
+    Opts = maps:with([stream_interceptors, unary_interceptors], Opts0),
     maybe
         {ok, Members} ?= get_member_list(Client, shuffle(Endpoints), Opts),
         {ok, Actives, Errors} ?= open_and_wait_members(Client, Members, Opts, [], []),
@@ -105,7 +118,7 @@ init({Client, Endpoints, Opts0}) ->
                     {ok, undefined};
                 R -> R
             end,
-        {ok, _Pid} ?= etcdgun_membership:start_link(Client),
+        % {ok, _Pid} ?= etcdgun_membership:start_link(Client),
         ?LOG_INFO(#{
             msg =>"Connected to etcd",
             members => Members,
@@ -117,10 +130,12 @@ init({Client, Endpoints, Opts0}) ->
             %% elp:ignore W0036
             members = maps:from_list([{Id, M} || #{'ID' := Id} = M <- Members]),
             actives = shuffle(Actives),
+            membership_check_interval = MembershipCheckInterval,
+            membership_tref = undefined,
             token = Token,
             cred = Cred
         },
-        {ok, start_retry_timer(State)}
+        {ok, start_membership_timer(start_retry_timer(State))}
     else
         {error, Reason} ->
             ?LOG_ERROR("Failed to connect to etcd endpoints: ~p, reason: ~p",
@@ -187,7 +202,50 @@ handle_call({update_cred, {Username, _Password} = Cred}, _From, #state{cred = _C
 handle_call(_Request, _From, State) ->
     {reply, {error, unsupported_call}, State}.
 
-handle_cast({sync_membership, NewMembers}, #state{members = OldMembers} = State) ->
+handle_cast({sync_membership, NewMembers}, #state{} = State) ->
+    {noreply, State, {continue, {do_sync_membership, NewMembers}}};
+
+handle_cast(_Msg, State) ->
+    {noreply, State}.
+
+handle_info({timeout, TRef, check_membership}, #state{membership_tref = TRef} = State) ->
+    #state{name = Client} = State,
+    Self = self(),
+    spawn(
+        fun() ->
+            maybe
+                {ok, Channel} ?= pick_channel(Self),
+                {ok, Members} ?= do_get_member_list(Channel),
+                Self ! {sync_membership, Members}
+            else
+                {error, Reason} ->
+                    ?LOG_WARNING("Failed to check membership for client ~p: ~p", [Client, Reason])
+            end
+        end),
+    {noreply, start_membership_timer(State#state{membership_tref = undefined})};
+handle_info({timeout, TRef, retry}, #state{retry_tref = TRef} = State) ->
+    {noreply, State#state{retry_tref = undefined}, {continue, do_retry}};
+
+handle_info({gun_up, GunPid, http2}, State) ->
+    %% TODO: check if the connected node is healthy
+    {noreply, handle_gun_up(GunPid, State)};
+handle_info({gun_down, GunPid, http2, Reason, _Streams}, State) ->
+    {noreply, handle_gun_down(GunPid, Reason, State)};
+handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
+    erlang:demonitor(MRef, [flush]),
+    {noreply, handle_gun_down(GunPid, Reason, State)};
+
+handle_info({check, Result, Elem}, State) ->
+    {noreply, handle_check_result(Result, Elem, State)};
+
+handle_info({sync_membership, NewMembers}, State) ->
+    {noreply, State, {continue, {do_sync_membership, NewMembers}}};
+
+handle_info(Info, State) ->
+    ?LOG_WARNING("Received unexpected info message: ~p", [Info]),
+    {noreply, State}.
+
+handle_continue({do_sync_membership, NewMembers}, #state{members = OldMembers} = State) ->
     ?LOG_DEBUG("Syncing membership for client ~p with members: ~p",
                [State#state.name, NewMembers]),
     %% Remove channels that are no longer in the membership
@@ -221,28 +279,6 @@ handle_cast({sync_membership, NewMembers}, #state{members = OldMembers} = State)
         connectings = Connectings1
     },
     {noreply, NewState, {continue, do_retry}};
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info({timeout, TRef, retry}, #state{retry_tref = TRef} = State) ->
-    {noreply, State#state{retry_tref = undefined}, {continue, do_retry}};
-
-handle_info({gun_up, GunPid, http2}, State) ->
-    %% TODO: check if the connected node is healthy
-    {noreply, handle_gun_up(GunPid, State)};
-handle_info({gun_down, GunPid, http2, Reason, _Streams}, State) ->
-    {noreply, handle_gun_down(GunPid, Reason, State)};
-handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
-    erlang:demonitor(MRef, [flush]),
-    {noreply, handle_gun_down(GunPid, Reason, State)};
-
-handle_info({check, Result, Elem}, State) ->
-    {noreply, handle_check_result(Result, Elem, State)};
-
-handle_info(Info, State) ->
-    ?LOG_WARNING("Received unexpected info message: ~p", [Info]),
-    {noreply, State}.
 
 handle_continue(do_retry, #state{connectings = OldConnectings} = State) ->
     cancel_retry_timer(State),
@@ -280,13 +316,21 @@ start_retry_timer(State) ->
     TRef = erlang:start_timer(?RETRY_INTERVAL, self(), retry),
     State#state{retry_tref = TRef}.
 
+start_membership_timer(#state{membership_check_interval = Interval} = State) when Interval > 0 ->
+    TRef = erlang:start_timer(Interval, self(), check_membership),
+    State#state{membership_tref = TRef};
+start_membership_timer(#state{membership_check_interval = 0} = State) ->
+    State;
+start_membership_timer(#state{membership_check_interval = infinity} = State) ->
+    State.
+
 cancel_retry_timer(#state{retry_tref = undefined}) -> ok;
 cancel_retry_timer(#state{retry_tref = TRef}) -> erlang:cancel_timer(TRef).
 
 get_member_list(_Client, [], _Opts) -> {error, no_available_endpoints};
 get_member_list(Client, [{Host, Port} | Rest], Opts) ->
     with_channel(Host, Port, Opts, fun(Channel) ->
-        case etcdgun_membership:get_member_list(Channel) of
+        case do_get_member_list(Channel) of
             {ok, []} ->
                 ?LOG_WARNING("No members found in etcd cluster at ~s:~p", [Host, Port]),
                 get_member_list(Client, Rest, Opts);
@@ -304,6 +348,15 @@ with_channel(Host, Port, Opts, Fun) ->
         Result = Fun(Channel),
         egrpc_stub:close(Channel),
         Result
+    end.
+
+do_get_member_list(Channel) ->
+    maybe
+        {ok, #{members := Members0}} ?= etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+        Members = [M || #{} = M <- Members0,
+                        (L = maps:get(isLearner, M, false)) =/= true,
+                        L =/= 1],
+        {ok, Members}
     end.
 
 open_and_wait_members(_Client, [], _Opts, [], _Errors) -> {error, no_available_endpoints};
