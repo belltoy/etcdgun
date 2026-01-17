@@ -1,0 +1,3 @@
+[tools]
+erlang = "26.2"
+rebar = "3.24.0"
