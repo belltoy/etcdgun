@@ -1,3 +1,5 @@
+[![Hex Version](https://img.shields.io/hexpm/v/etcdgun.svg)](https://hex.pm/packages/etcdgun) [![Hex Docs](https://img.shields.io/badge/docs-hexpm-blue.svg)](https://hexdocs.pm/etcdgun/)
+
 An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrpc](https://github.com/belltoy/egrpc).
 
 ## Features
