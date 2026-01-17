@@ -1,0 +1,27 @@
+words = [
+    "bidi",
+    "connectings",
+    "egrpc",
+    "eqwalizer",
+    "eunit",
+    "gpb",
+    "ifdef",
+    "inet",
+    "ipath",
+    "keepalive",
+    "mgmt",
+    "mvcc",
+    "nofin",
+    "retryings",
+    "tref",
+    "ttl",
+    "urlexist",
+]
+ignore_paths = [".codebook.toml"]
+ignore_patterns = [
+    "etcdgun.*",
+    "etcdserver",
+    "etcd.*pb.*",
+    "v3.*pb.*",
+    "clientv3.*",
+]
