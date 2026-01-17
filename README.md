@@ -24,8 +24,8 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
 
 Generating etcd v3 API codes via the proto files in etcd v3.5.10, without changing their packets.
 
-Extract `ResponseHeader` from `rpc.proto` into `response_header.proto` to avoid [gpb](https://hex.pm/packages/gpb) to generate the
-same structure in multiple output pb modules.
+Extract `ResponseHeader` from `rpc.proto` into `response_header.proto` to avoid
+[gpb](https://hex.pm/packages/gpb) to generate the same structure in multiple output pb modules.
 
 ## Client APIs
 
@@ -36,11 +36,15 @@ Client = foo,
 Opts = #{},
 {ok, _Pid} = etcdgun:open(my_client, [{"127.0.0.1", 2379}], Opts),
 
-% Now you can use `my_client` to pick channels and call the etcd gRPC APIs.
+%% Now you can use `my_client' to pick channels and call the etcd gRPC APIs.
 {ok, Channel} = etcdgun_client:pick_channel(my_client).
-{ok, #{header := _, members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}).
 
-{ok,#{status => 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}).
+%% Get etcd member list via v3 API
+{ok, #{header := _, members := Members}} =
+    etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}).
+
+%% Check heath via egrpc provided standard health check API
+{ok, #{status => 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}).
 ```
 
 ### Client Options
@@ -54,10 +58,14 @@ Support unary interceptors and streaming interceptors.
 
 ## Development
 
-```bash
-# Generate pb modules
-rebar3 protobuf compile
+### To Generate Protobuf Modules
 
-# Generate the etcd gRPC client code
+```bash
+rebar3 protobuf compile
+```
+
+### To Generate the etcd gRPC Client Codes
+
+```bash
 rebar3 egrpc gen
 ```

@@ -45,3 +45,4 @@ rebar3.crashdump
 
 # End of https://www.toptal.com/developers/gitignore/api/erlang
 /rebar.lock
+doc/
