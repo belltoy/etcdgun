@@ -1,5 +1,6 @@
-%% Connect to all etcd servers in a cluster, implementing the clientv3-grpc1.23
-%% https://etcd.io/docs/v3.5/learning/design-client/#clientv3-grpc123-balancer-overview
+%% @doc Connect to all etcd servers in a cluster, implementing the clientv3-grpc1.23
+%% [https://etcd.io/docs/v3.5/learning/design-client/#clientv3-grpc123-balancer-overview
+%% Balancer Overview]
 
 -module(etcdgun_client).
 

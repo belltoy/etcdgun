@@ -51,7 +51,7 @@ Opts = #{},
 
 ### Client Options
 
-See `etcdgun:opts()` for the available options.
+See [`etcdgun:opts()`](https://hexdocs.pm/etcdgun/etcdgun.html#t:opts/0) for the available options.
 
 Support unary interceptors and streaming interceptors.
 

@@ -36,6 +36,7 @@ clients() ->
     ],
     [Info || {ok, Info} <- Clients].
 
+%% @doc Equivalent to `open(Client, Endpoints, #{})', see `open/3'.
 -spec open(client(), [endpoint()]) -> {ok, pid()} | {error, Reason :: term()}.
 open(Client, Endpoints) ->
     open(Client, Endpoints, #{}).
@@ -55,6 +56,7 @@ cancel_watch(Client, WatcherName) ->
 
 -define(UNBOUND_RANGE_END, "\0").
 
+%% @doc Given a etcd key, return the end key for a prefix range.
 -spec prefix_range_end(Key :: binary() | string()) -> string().
 prefix_range_end(Key) when is_binary(Key) ->
     prefix_range_end(binary_to_list(Key));

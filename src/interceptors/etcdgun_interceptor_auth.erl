@@ -1,3 +1,10 @@
+%% @doc This module provides a gRPC interceptor that handles authentication for etcd gRPC requests.
+%% It adds authentication tokens to requests that require authentication and refreshes tokens when
+%% they expire.
+%%
+%% See `authenticate/4' and `refresh_token/4' functions for implementation details.
+%%
+%% See also `t:egrpc_stub:unary_interceptor/0' for the type of gRPC unary interceptor.
 -module(etcdgun_interceptor_auth).
 
 -feature(maybe_expr, enable).

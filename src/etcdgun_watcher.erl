@@ -1,3 +1,4 @@
+%% @private
 -module(etcdgun_watcher).
 
 -feature(maybe_expr, enable).

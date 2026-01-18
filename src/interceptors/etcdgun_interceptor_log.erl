@@ -1,3 +1,10 @@
+%% @doc This module provides a gRPC interceptor that logs details about each gRPC request of etcd,
+%% including the service and method names, request parameters (with sensitive data redacted),
+%% and the duration of the request processing.
+%%
+%% See `log/4' function for implementation details.
+%%
+%% See also `t:egrpc_stub:unary_interceptor/0' for the type of gRPC unary interceptor.
 -module(etcdgun_interceptor_log).
 
 -include_lib("kernel/include/logger.hrl").

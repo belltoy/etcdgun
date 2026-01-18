@@ -1,3 +1,5 @@
+%% @doc This module is an egrpc stream interceptor that adds authentication tokens to certain etcd gRPC calls.
+%% See `e:egrpc:egrpc_stream_interceptor' for the more.
 -module(etcdgun_stream_interceptor_auth).
 
 -feature(maybe_expr, enable).

@@ -1,3 +1,4 @@
+%% @private
 -module(etcdgun_watcher_sup).
 
 -behaviour(supervisor).
