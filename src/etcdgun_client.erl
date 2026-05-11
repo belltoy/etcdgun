@@ -272,7 +272,7 @@ handle_continue({do_sync_membership, NewMembers}, #state{members = OldMembers} =
                                               [maps:values(ToRemovesMap)]),
     maps:size(ToAdds) > 0 andalso ?LOG_INFO("Adding etcd members: ~p", [maps:values(ToAdds)]),
 
-    [egrpc_stub:close(Channel) || {_, Channel} <- ToRemoveActives ++ ToRemoveConnectings],
+    [egrpc_stub:close(Channel) || {_, Channel, _} <- ToRemoveActives ++ ToRemoveConnectings],
 
     NewState = State#state{
         members = NewMembersMap,
