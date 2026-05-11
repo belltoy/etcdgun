@@ -6,7 +6,6 @@ words = [
     "eunit",
     "gpb",
     "ifdef",
-    "inet",
     "ipath",
     "keepalive",
     "mgmt",
