@@ -9,19 +9,22 @@ services:
             - '--logger=zap'
             - '--data-dir=/etcd_data'
             - '--listen-peer-urls=http://0.0.0.0:2380'
-            - '--listen-client-urls=http://0.0.0.0:2379'
+            - '--listen-client-urls=${ETCD_SCHEME:-http}://0.0.0.0:2379'
             - '--initial-advertise-peer-urls=http://etcd-1:2380'
-            - '--advertise-client-urls=http://127.0.0.1:2379'
+            - '--advertise-client-urls=${ETCD_SCHEME:-http}://127.0.0.1:2379'
             - '--initial-cluster-token=etcd-cluster'
             - '--heartbeat-interval=250'
             - '--election-timeout=1250'
             - '--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380'
             - '--initial-cluster-state=new'
+            - '--cert-file=${ETCD_CERT_FILE:-}'
+            - '--key-file=${ETCD_KEY_FILE:-}'
         ports:
             - 2379:2379
             - 12379:2379
         volumes:
             - ./${ETCD_DATA_DIR:-data}/etcd-1:/etcd_data
+            - ./${ETCD_CERT_DIR:-data/certs}:/certs:ro
     etcd-2:
         image: "quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.10}"
         entrypoint: /usr/local/bin/etcd
@@ -32,19 +35,22 @@ services:
             - '--logger=zap'
             - '--data-dir=/etcd_data'
             - '--listen-peer-urls=http://0.0.0.0:2380'
-            - '--listen-client-urls=http://0.0.0.0:2379'
+            - '--listen-client-urls=${ETCD_SCHEME:-http}://0.0.0.0:2379'
             - '--initial-advertise-peer-urls=http://etcd-2:2380'
-            - '--advertise-client-urls=http://127.0.0.1:2479'
+            - '--advertise-client-urls=${ETCD_SCHEME:-http}://127.0.0.1:2479'
             - '--initial-cluster-token=etcd-cluster'
             - '--heartbeat-interval=250'
             - '--election-timeout=1250'
             - '--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380'
             - '--initial-cluster-state=new'
+            - '--cert-file=${ETCD_CERT_FILE:-}'
+            - '--key-file=${ETCD_KEY_FILE:-}'
         ports:
             - 2479:2379
             - 22379:2379
         volumes:
             - ./${ETCD_DATA_DIR:-data}/etcd-2:/etcd_data
+            - ./${ETCD_CERT_DIR:-data/certs}:/certs:ro
     etcd-3:
         image: "quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.10}"
         entrypoint: /usr/local/bin/etcd
@@ -55,16 +61,19 @@ services:
             - '--logger=zap'
             - '--data-dir=/etcd_data'
             - '--listen-peer-urls=http://0.0.0.0:2380'
-            - '--listen-client-urls=http://0.0.0.0:2379'
+            - '--listen-client-urls=${ETCD_SCHEME:-http}://0.0.0.0:2379'
             - '--initial-advertise-peer-urls=http://etcd-3:2380'
-            - '--advertise-client-urls=http://127.0.0.1:2579'
+            - '--advertise-client-urls=${ETCD_SCHEME:-http}://127.0.0.1:2579'
             - '--initial-cluster-token=etcd-cluster'
             - '--heartbeat-interval=250'
             - '--election-timeout=1250'
             - '--initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,etcd-3=http://etcd-3:2380'
             - '--initial-cluster-state=new'
+            - '--cert-file=${ETCD_CERT_FILE:-}'
+            - '--key-file=${ETCD_KEY_FILE:-}'
         ports:
             - 2579:2379
             - 32379:2379
         volumes:
             - ./${ETCD_DATA_DIR:-data}/etcd-3:/etcd_data
+            - ./${ETCD_CERT_DIR:-data/certs}:/certs:ro

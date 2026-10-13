@@ -178,19 +178,31 @@ username({Username, _Password}) -> Username;
 username(undefined) -> undefined.
 
 do_init(Client, Endpoints, Opts0, Cred) ->
+    case maps:get(transport, Opts0, tcp) of
+        Transport when Transport =:= tcp; Transport =:= tls ->
+            do_init(Client, Endpoints, Opts0, Cred, Transport);
+        Other ->
+            ?LOG_ERROR("Invalid transport: ~p, tcp or tls", [Other]),
+            {stop, {invalid_transport, Other}}
+    end.
+
+do_init(Client, Endpoints, Opts0, Cred, Transport) ->
     MembershipCheckInterval =
         case maps:get(membership_check_interval, Opts0, ?MEMBERSHIP_CHECK_INTERVAL) of
             I when is_integer(I) andalso I >= 0 -> I;
             infinity -> infinity;
             _ -> ?MEMBERSHIP_CHECK_INTERVAL
         end,
-    Opts = (maps:with([interceptors], Opts0))#{
+    %% The options of every channel. The transport of the members is the scheme of their client
+    %% URLs, and `Transport' is the one of the endpoints which are given to connect to.
+    Opts = (maps:with([interceptors, gun_opts], Opts0))#{
         call_credentials => fun etcdgun_interceptor_auth:call_credentials/1
     },
     maybe
         %% Authenticate first, the RPCs of getting the members and checking them require the token
         %% in etcd 3.6 and 3.7 when authentication is enabled.
-        {ok, Members, Token} ?= get_member_list(Client, shuffle(Endpoints), Cred, Opts),
+        {ok, Members, Token} ?=
+            get_member_list(Client, shuffle(Endpoints), Cred, with_transport(Opts, Transport)),
         {ok, Actives, Errors} ?= open_and_wait_members(Client, Members, Token, Opts, [], []),
         % {ok, _Pid} ?= etcdgun_membership:start_link(Client),
         ?LOG_INFO(#{
@@ -498,8 +510,9 @@ open_and_wait_members(_Client, [], _Token, _Opts, Success, Errors) -> {ok, Succe
 open_and_wait_members(Client, [#{'ID' := Id} = Member | Rest], Token, Opts, Success, Errors) ->
     maybe
         #{clientURLs := [ClientUrl | _]} = Member,
-        {ok, Host, Port, _Transport} ?= parse_client_url(ClientUrl),
-        {ok, Channel} ?= open_and_wait(Host, Port, Opts#{info => #{client => Client}}),
+        {ok, Host, Port, Transport} ?= parse_client_url(ClientUrl),
+        ChannelOpts = (with_transport(Opts, Transport))#{info => #{client => Client}},
+        {ok, Channel} ?= open_and_wait(Host, Port, ChannelOpts),
         ok ?= close_on_error(Channel, check_endpoint(with_token(Channel, Token))),
         GunPid = egrpc_stub:conn_pid(Channel),
         MRef = erlang:monitor(process, GunPid),
@@ -540,8 +553,9 @@ open_members(_Client, [], _Opts, Result) -> Result;
 open_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success) ->
     #{clientURLs := [ClientUrl | _]} = Member,
     maybe
-        {ok, Host, Port, _Transport} ?= parse_client_url(ClientUrl),
-        {ok, Channel} ?= egrpc_stub:open(Host, Port, Opts#{info => #{client => Client}}),
+        {ok, Host, Port, Transport} ?= parse_client_url(ClientUrl),
+        ChannelOpts = (with_transport(Opts, Transport))#{info => #{client => Client}},
+        {ok, Channel} ?= egrpc_stub:open(Host, Port, ChannelOpts),
         MRef = erlang:monitor(process, egrpc_stub:conn_pid(Channel)),
         open_members(Client, Rest, Opts, [{Id, Channel, MRef} | Success])
     end.
@@ -558,12 +572,23 @@ authenticate(Channel, {Username, Password}) ->
         {ok, Token}
     end.
 
+scheme_transport("http") -> {ok, tcp};
+scheme_transport("https") -> {ok, tls};
+scheme_transport(_) -> error.
+
+%% `gun_opts' of the user (e.g. `tls_opts') are kept, only the transport is added for TLS.
+with_transport(Opts, tcp) ->
+    Opts;
+with_transport(Opts, tls) ->
+    GunOpts = maps:get(gun_opts, Opts, #{}),
+    Opts#{gun_opts => GunOpts#{transport => tls}}.
+
 parse_client_url(ClientUrl) when is_binary(ClientUrl) ->
     parse_client_url(binary_to_list(ClientUrl));
 parse_client_url(ClientUrl) ->
     maybe
         #{host := Host, port := Port, scheme := Scheme} ?= uri_string:parse(ClientUrl),
-        Transport ?= case Scheme of "http" -> tcp; "https" -> tls end,
+        {ok, Transport} ?= scheme_transport(Scheme),
         {ok, Host, Port, Transport}
     else
         _ -> {error, invalid_client_url}
@@ -713,6 +738,20 @@ format_status_test() ->
     ?assertMatch(#{state := #state{cred = undefined, token = undefined}},
                  format_status(#{state => NoCred})),
     ?assertEqual(#{reason => x}, format_status(#{reason => x})).
+
+parse_client_url_test() ->
+    ?assertEqual({ok, "127.0.0.1", 2379, tcp}, parse_client_url(<<"http://127.0.0.1:2379">>)),
+    ?assertEqual({ok, "etcd.local", 2379, tls}, parse_client_url("https://etcd.local:2379")),
+    ?assertEqual({error, invalid_client_url}, parse_client_url(<<"unix://127.0.0.1:2379">>)),
+    ?assertEqual({error, invalid_client_url}, parse_client_url(<<"127.0.0.1:2379">>)),
+    ok.
+
+with_transport_test() ->
+    Opts = #{interceptors => [], gun_opts => #{tls_opts => [{verify, verify_none}]}},
+    ?assertEqual(Opts, with_transport(Opts, tcp)),
+    ?assertEqual(Opts#{gun_opts := #{tls_opts => [{verify, verify_none}], transport => tls}},
+                 with_transport(Opts, tls)),
+    ?assertEqual(#{gun_opts => #{transport => tls}}, with_transport(#{}, tls)).
 
 normalize_cred_test() ->
     ?assertEqual({ok, {<<"root">>, <<"123456">>}}, normalize_cred({"root", "123456"})),

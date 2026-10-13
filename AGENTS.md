@@ -18,7 +18,7 @@ Erlang gRPC client for etcd v3 (229 source files). Auto-generates gRPC service s
 | `rebar3 compile` | Build with code generation (proto → egrpc → compile) |
 | `rebar3 eunit` | Run embedded tests (in src/etcdgun.erl and src/etcdgun_client.erl) |
 | `rebar3 ct` | Integration tests in `test/etcdgun_SUITE.erl`, need a running etcd cluster with auth (`just etcd-up [version]`); skipped if it is not reachable |
-| `just ct-all` | Run the CT suite on etcd v3.5.10, v3.6.5 and v3.7.0, each from a clean cluster (data in `data/ct/`) which is destroyed afterwards; the images must be pulled |
+| `just ct-all` | Run `etcdgun_SUITE` (http) and `etcdgun_tls_SUITE` (https) on etcd v3.5.10, v3.6.5 and v3.7.0, each from a clean cluster (data in `data/ct/`) which is destroyed afterwards; the images must be pulled |
 | `rebar3 fmt -w` | Format code with erlfmt |
 | `rebar3 dialyzer` | Static type analysis |
 | `rebar3 ex_doc` | Generate hexdocs documentation |

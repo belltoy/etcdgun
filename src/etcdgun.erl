@@ -25,8 +25,12 @@
 -type opts() :: #{
       %% A binary or a string, neither is empty, otherwise `{error, invalid_cred}'.
       cred => {Username :: binary() | string(), Password :: binary() | string()},
-      %% Not used yet, the scheme of the client URLs is ignored.
+      %% The transport of the `Endpoints' to connect to, `tcp' by default. The transport of the
+      %% members of the cluster is the scheme of their client URLs, `http' or `https'.
       transport => tcp | tls,
+      %% The options of gun for every connection, e.g. `#{tls_opts => [{cacertfile, "ca.pem"}]}'
+      %% for `https'. The `transport' is set by etcdgun.
+      gun_opts => gun:opts(),
       %% How often to check the members of the cluster, in milliseconds, 5 minutes by default.
       %% `0' and `infinity' disable the check.
       membership_check_interval => non_neg_integer() | infinity,
