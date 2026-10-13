@@ -77,3 +77,39 @@ rebar3 protobuf compile
 ```bash
 rebar3 egrpc gen
 ```
+
+### To Run the Tests
+
+The unit tests are inline eunit tests and need nothing else:
+
+```bash
+rebar3 eunit
+```
+
+The integration tests are a Common Test suite, [`test/etcdgun_SUITE.erl`](test/etcdgun_SUITE.erl),
+which runs against a real etcd cluster. It needs [just](https://github.com/casey/just) and
+docker, and the etcd images `quay.io/coreos/etcd:v3.5.10`, `v3.6.5` and `v3.7.0` (`docker pull`
+them first).
+
+Run the suite on every supported etcd version. Each version starts from a clean 3-node cluster
+with authentication enabled (`root` / `123456`), and the cluster and its data are destroyed
+afterwards, so every run is a regression from scratch:
+
+```bash
+just ct-all
+```
+
+Run the suite on one version by yourself:
+
+```bash
+just etcd-up v3.6.5     # start the cluster in the background, auth enabled
+rebar3 ct               # the suite is skipped if no cluster is reachable
+just etcd-ct-destroy    # remove the containers and the data
+```
+
+The test clusters publish the client ports 2379, 2479 and 2579 and keep their data in
+`data/ct/`, they do not touch the data of the development cluster started by `just etcd`. Stop
+that one first, as the ports are the same.
+
+Two cases (`member_down` and `member_add_remove`) stop and add etcd members through docker, and
+are skipped if docker is not available.
