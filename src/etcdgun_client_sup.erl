@@ -18,14 +18,34 @@ start_child(Client, Endpoints, Opts) ->
     %% Silently dropping them would leave the interceptors of the former versions not working.
     case [K || K <- ?REMOVED_OPTS, is_map_key(K, Opts)] of
         [] ->
-            Child = child_spec(Client, Endpoints, Opts),
-            case supervisor:start_child(?MODULE, Child) of
-                {ok, Pid} when is_pid(Pid) -> {ok, Pid};
-                {error, Reason} -> {error, Reason}
+            case hide_cred(Opts) of
+                {ok, Opts1} -> do_start_child(Client, Endpoints, Opts1);
+                {error, _} = Error -> Error
             end;
         [Key | _] ->
             {error, {removed_option, Key}}
     end.
+
+do_start_child(Client, Endpoints, Opts) ->
+    Child = child_spec(Client, Endpoints, Opts),
+    case supervisor:start_child(?MODULE, Child) of
+        {ok, Pid} when is_pid(Pid) -> {ok, Pid};
+        %% The child spec is in the error of a failed start.
+        {error, {Reason, Spec}} when is_tuple(Spec), element(1, Spec) =:= child ->
+            {error, Reason};
+        {error, Reason} -> {error, Reason}
+    end.
+
+%% The child spec is printed by the supervisor, in the reports and in `which_children'-like calls
+%% (`supervisor:get_childspec/2'), and the credentials must not be in it. A fun is printed as a
+%% reference to the module, not with what it captured.
+hide_cred(#{cred := Cred} = Opts) when Cred =/= undefined ->
+    case etcdgun_client:normalize_cred(Cred) of
+        {ok, Normalized} -> {ok, Opts#{cred := fun() -> Normalized end}};
+        {error, _} = Error -> Error
+    end;
+hide_cred(Opts) ->
+    {ok, Opts}.
 
 -spec stop_child(etcdgun:client()) -> ok | {error, not_found}.
 stop_child(Client) ->
@@ -58,6 +78,16 @@ child_spec(Client, Endpoints, Opts) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+hide_cred_test() ->
+    {ok, #{cred := Fun} = Opts} = hide_cred(#{cred => {"root", "secret"}, other => 1}),
+    ?assertEqual({<<"root">>, <<"secret">>}, Fun()),
+    ?assertEqual(1, maps:get(other, Opts)),
+    %% nothing of the secret is in what is printed
+    ?assertEqual(nomatch, string:find(lists:flatten(io_lib:format("~0p", [Opts])), "secret")),
+    ?assertEqual({ok, #{}}, hide_cred(#{})),
+    ?assertEqual({ok, #{cred => undefined}}, hide_cred(#{cred => undefined})),
+    ?assertEqual({error, invalid_cred}, hide_cred(#{cred => {"root", ""}})).
 
 removed_option_test() ->
     % eqwalizer:ignore

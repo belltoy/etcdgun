@@ -20,7 +20,8 @@
     handle_cast/2,
     handle_info/2,
     handle_continue/2,
-    terminate/2
+    terminate/2,
+    format_status/1
 ]).
 
 -export([
@@ -29,6 +30,7 @@
     unset_cred/1,
     pick_channel/1,
     cached_token/1,
+    normalize_cred/1,
     refresh_token/1,
     sync_membership/2
 ]).
@@ -66,12 +68,47 @@ client_info(Client) ->
 %%
 %% On failure, for example a wrong password or no available connection, the old credentials and
 %% the old token are kept, and `{error, Reason}' is returned.
+%%
+%% The username and the password are a binary or a string, neither of them is empty, otherwise
+%% `{error, invalid_cred}' is returned.
 -spec update_cred(etcdgun:client(), Username, Password) -> ok | {error, term()} when
-    Username :: binary(),
-    Password :: binary().
+    Username :: binary() | string(),
+    Password :: binary() | string().
 update_cred(Client, Username, Password) ->
-    % eqwalizer:ignore
-    gen_server:call(Client, {update_cred, {Username, Password}}).
+    case normalize_cred({Username, Password}) of
+        {ok, Cred} ->
+            % eqwalizer:ignore
+            gen_server:call(Client, {update_cred, Cred});
+        {error, _} = Error ->
+            Error
+    end.
+
+%% @doc The credentials as the binaries of the username and the password.
+%%
+%% Each of them is a binary or a string (unicode characters), and not empty. The reason does not
+%% have the credentials in it, as it goes to logs and crash reports.
+-spec normalize_cred(term()) -> {ok, {binary(), binary()}} | {error, invalid_cred}.
+normalize_cred({Username, Password}) ->
+    case {to_binary(Username), to_binary(Password)} of
+        {Username1, Password1} when is_binary(Username1), is_binary(Password1),
+                                    Username1 =/= <<>>, Password1 =/= <<>> ->
+            {ok, {Username1, Password1}};
+        _ ->
+            {error, invalid_cred}
+    end;
+normalize_cred(_) ->
+    {error, invalid_cred}.
+
+to_binary(Bin) when is_binary(Bin) -> Bin;
+to_binary(List) when is_list(List) ->
+    try unicode:characters_to_binary(List) of
+        Bin when is_binary(Bin) -> Bin;
+        _ -> error
+    catch
+        error:badarg -> error
+    end;
+to_binary(_) ->
+    error.
 
 -spec unset_cred(etcdgun:client()) -> ok.
 unset_cred(Client) ->
@@ -123,13 +160,24 @@ start_link(Client, Endpoints, Options) ->
 init({Client, Endpoints, Opts0}) ->
     process_flag(trap_exit, true),
     logger:update_process_metadata(#{etcdgun_client => Client}),
-    Cred =
-        case maps:get(cred, Opts0, undefined) of
-            {Username, Password} when is_list(Username), is_list(Password),
-                                      length(Username) > 0, length(Password) >0 ->
-                {Username, Password};
-            _ -> undefined
-        end,
+    case parse_cred(maps:get(cred, Opts0, undefined)) of
+        {ok, Cred} ->
+            do_init(Client, Endpoints, Opts0, Cred);
+        {error, invalid_cred} ->
+            ?LOG_ERROR("Invalid credentials, a username and a password, both not empty"),
+            {stop, invalid_cred}
+    end.
+
+parse_cred(undefined) -> {ok, undefined};
+%% From `etcdgun_client_sup:start_child/3', the credentials are hidden in a fun there, so that
+%% they are not in the child spec, which is printed in the reports of the supervisor.
+parse_cred(Fun) when is_function(Fun, 0) -> parse_cred(Fun());
+parse_cred(Cred) -> normalize_cred(Cred).
+
+username({Username, _Password}) -> Username;
+username(undefined) -> undefined.
+
+do_init(Client, Endpoints, Opts0, Cred) ->
     MembershipCheckInterval =
         case maps:get(membership_check_interval, Opts0, ?MEMBERSHIP_CHECK_INTERVAL) of
             I when is_integer(I) andalso I >= 0 -> I;
@@ -177,8 +225,10 @@ handle_call(client_info, _From, State) ->
         actives => length(State#state.actives),
         connectings => length(State#state.connectings),
         members => maps:values(State#state.members),
-        token => State#state.token,
-        cred => State#state.cred
+        %% Neither the password nor the token, this is what `etcdgun:clients/0' returns and what
+        %% ends up in logs.
+        username => username(State#state.cred),
+        authenticated => State#state.token =/= undefined
     },
     {reply, {ok, Reply}, State};
 
@@ -322,6 +372,15 @@ handle_continue(do_retry, #state{connectings = OldConnectings} = State) ->
         end,
     State1 = State#state{connectings = OldConnectings ++ Connectings},
     {noreply, start_retry_timer(State1)}.
+
+%% The state is in the crash reports and the output of `sys:get_status/1', without the secrets.
+format_status(#{state := #state{} = State} = Status) ->
+    Status#{state := State#state{cred = redact(State#state.cred), token = redact(State#state.token)}};
+format_status(Status) ->
+    Status.
+
+redact(undefined) -> undefined;
+redact(_Secret) -> '<redacted>'.
 
 terminate(_Reason, #state{actives = Actives, connectings = Connectings} = State) ->
     ?LOG_NOTICE("Terminating etcdgun client, reason: ~p", [_Reason]),
@@ -643,6 +702,31 @@ publish_token_test() ->
     after
         ets:delete(?TOKEN_TABLE)
     end.
+
+format_status_test() ->
+    State = #state{name = foo, cred = {<<"root">>, <<"secret">>}, token = <<"token">>},
+    #{state := Redacted} = format_status(#{state => State}),
+    ?assertEqual('<redacted>', Redacted#state.cred),
+    ?assertEqual('<redacted>', Redacted#state.token),
+    ?assertEqual(foo, Redacted#state.name),
+    NoCred = #state{name = foo, cred = undefined, token = undefined},
+    ?assertMatch(#{state := #state{cred = undefined, token = undefined}},
+                 format_status(#{state => NoCred})),
+    ?assertEqual(#{reason => x}, format_status(#{reason => x})).
+
+normalize_cred_test() ->
+    ?assertEqual({ok, {<<"root">>, <<"123456">>}}, normalize_cred({"root", "123456"})),
+    ?assertEqual({ok, {<<"root">>, <<"123456">>}}, normalize_cred({<<"root">>, <<"123456">>})),
+    ?assertEqual({ok, {<<"root">>, <<"123456">>}}, normalize_cred({<<"root">>, "123456"})),
+    %% unicode characters of a string are utf-8 encoded
+    ?assertEqual({ok, {<<"用户"/utf8>>, <<"p">>}}, normalize_cred({[29992, 25143], "p"})),
+    %% the reason has no credentials in it
+    Invalid = [
+        {"", "p"}, {"u", ""}, {<<>>, <<"p">>}, {<<"u">>, <<>>}, {u, "p"}, {"u", 1},
+        {[a], "p"}, {"u"}, {"u", "p", "x"}, "up", undefined, #{name => "u"}
+    ],
+    [?assertEqual({error, invalid_cred}, normalize_cred(C)) || C <- Invalid],
+    ok.
 
 is_auth_required_test() ->
     UserEmpty = {grpc_error, invalid_argument, <<"etcdserver: user name is empty">>},

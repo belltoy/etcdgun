@@ -10,6 +10,9 @@
 -export([
     no_credentials/1,
     wrong_password/1,
+    invalid_cred/1,
+    secrets_not_exposed/1,
+    binary_cred/1,
     kv_and_cluster/1,
     update_and_unset_cred/1,
     token_refresh/1,
@@ -32,6 +35,9 @@ all() ->
     [
         no_credentials,
         wrong_password,
+        invalid_cred,
+        secrets_not_exposed,
+        binary_cred,
         kv_and_cluster,
         update_and_unset_cred,
         token_refresh,
@@ -59,7 +65,9 @@ end_per_suite(_Config) ->
     application:stop(etcdgun),
     ok.
 
-init_per_testcase(Case, Config) when Case =:= no_credentials; Case =:= wrong_password ->
+init_per_testcase(Case, Config)
+  when Case =:= no_credentials; Case =:= wrong_password; Case =:= invalid_cred;
+       Case =:= binary_cred; Case =:= secrets_not_exposed ->
     Config;
 init_per_testcase(Case, Config)
   when Case =:= member_down; Case =:= member_add_remove; Case =:= learner_member ->
@@ -108,6 +116,70 @@ wrong_password(_Config) ->
     Res = open_without_cred(#{cred => {"root", "wrong-password"}}),
     ?assertMatch({error, _}, Res).
 
+%% A credential which is not a username and a password, both not empty, is an error, not a client
+%% which silently has no authentication.
+invalid_cred(_Config) ->
+    Opts = #{membership_check_interval => infinity},
+    [?assertEqual({error, invalid_cred}, etcdgun:open(?CLIENT, ?ENDPOINTS, Opts#{cred => Cred}))
+     || Cred <- [{"", "123456"}, {"root", ""}, {root, "123456"}, "root"]],
+    %% the same through the update of a client, which is kept as it was
+    {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts#{cred => ?CRED}),
+    try
+        {ok, Token} = etcdgun_client:cached_token(?CLIENT),
+        ?assertEqual({error, invalid_cred}, etcdgun_client:update_cred(?CLIENT, "", "x")),
+        ?assertEqual({ok, Token}, etcdgun_client:cached_token(?CLIENT))
+    after
+        ok = etcdgun:close(?CLIENT)
+    end.
+
+%% The password and the token are not in what a client shows: `client_info/1', the child spec of
+%% the supervisor, `sys:get_status/1', and the error of a failed open.
+secrets_not_exposed(_Config) ->
+    Password = "s3cr3t-pa55",
+    Secrets = [Password, "wrong-pa55"],
+    Shown = fun(Term) -> lists:flatten(io_lib:format("~0p", [Term])) end,
+    %% a wrong password is an error, which does not have it in it
+    Res = etcdgun:open(?CLIENT, ?ENDPOINTS, #{cred => {"root", "wrong-pa55"},
+                                            membership_check_interval => infinity}),
+    ?assertMatch({error, _}, Res),
+    [?assertEqual(nomatch, string:find(Shown(Res), S)) || S <- Secrets],
+    %% a client which is running, with the password of the cluster
+    {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, #{cred => ?CRED,
+                                                membership_check_interval => infinity}),
+    try
+        {ok, Token} = etcdgun_client:cached_token(?CLIENT),
+        {ok, Info} = etcdgun_client:client_info(?CLIENT),
+        Views = [
+            Info,
+            etcdgun:clients(),
+            supervisor:get_childspec(etcdgun_client_sup, ?CLIENT),
+            sys:get_status(?CLIENT)
+        ],
+        [begin
+             ?assertEqual(nomatch, string:find(Shown(View), "123456")),
+             ?assertEqual(nomatch, string:find(Shown(View), binary_to_list(Token)))
+         end || View <- Views],
+        ?assertMatch(#{username := <<"root">>, authenticated := true}, Info),
+        ?assertNot(maps:is_key(cred, Info)),
+        ?assertNot(maps:is_key(token, Info))
+    after
+        ok = etcdgun:close(?CLIENT)
+    end.
+
+%% The username and the password may be binaries, for the options and `update_cred/3'.
+binary_cred(_Config) ->
+    Opts = #{membership_check_interval => infinity, cred => {<<"root">>, <<"123456">>}},
+    {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts),
+    try
+        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+        ok = etcdgun_client:update_cred(?CLIENT, "root", <<"123456">>),
+        {ok, Channel1} = etcdgun_client:pick_channel(?CLIENT),
+        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel1, #{key => key()})
+    after
+        ok = etcdgun:close(?CLIENT)
+    end.
+
 kv_and_cluster(_Config) ->
     {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
     Key = key(),
@@ -118,21 +190,23 @@ kv_and_cluster(_Config) ->
     ?assertEqual(3, length(Members)),
     {ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}),
     {ok, Info} = etcdgun_client:client_info(?CLIENT),
-    ?assertMatch(#{actives := 3, token := <<_/binary>>}, Info).
+    ?assertMatch(#{actives := 3, authenticated := true, username := <<"root">>}, Info),
+    ?assertMatch({ok, <<_/binary>>}, etcdgun_client:cached_token(?CLIENT)).
 
 %% The token of a wrong password is not taken, the old one is kept.
 update_and_unset_cred(_Config) ->
-    {ok, #{token := Token0}} = etcdgun_client:client_info(?CLIENT),
+    {ok, Token0} = etcdgun_client:cached_token(?CLIENT),
     ?assertMatch({error, _}, etcdgun_client:update_cred(?CLIENT, <<"root">>, <<"nope">>)),
-    {ok, #{token := Token0}} = etcdgun_client:client_info(?CLIENT),
+    ?assertEqual({ok, Token0}, etcdgun_client:cached_token(?CLIENT)),
     ok = etcdgun_client:update_cred(?CLIENT, <<"root">>, <<"123456">>),
-    {ok, #{token := Token1}} = etcdgun_client:client_info(?CLIENT),
+    {ok, Token1} = etcdgun_client:cached_token(?CLIENT),
     ?assert(is_binary(Token1)),
     {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
     {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
     %% Without the credentials the token is dropped, so the server rejects the request.
     ok = etcdgun_client:unset_cred(?CLIENT),
-    {ok, #{token := undefined}} = etcdgun_client:client_info(?CLIENT),
+    ?assertMatch({ok, #{authenticated := false, username := undefined}},
+                 etcdgun_client:client_info(?CLIENT)),
     ?assertEqual(undefined, etcdgun_client:cached_token(?CLIENT)),
     {ok, Channel1} = etcdgun_client:pick_channel(?CLIENT),
     ?assertMatch({error, _}, etcdgun_etcdserverpb_kv_client:range(Channel1, #{key => key()})).

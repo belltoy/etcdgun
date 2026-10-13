@@ -23,7 +23,8 @@
 -type client() :: atom().
 -type endpoint() :: {Host :: string(), Port :: inet:port_number()}.
 -type opts() :: #{
-      cred => {Username :: string(), Password :: string()},
+      %% A binary or a string, neither is empty, otherwise `{error, invalid_cred}'.
+      cred => {Username :: binary() | string(), Password :: binary() | string()},
       %% Not used yet, the scheme of the client URLs is ignored.
       transport => tcp | tls,
       %% How often to check the members of the cluster, in milliseconds, 5 minutes by default.
