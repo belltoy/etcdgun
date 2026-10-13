@@ -41,6 +41,10 @@ clients() ->
 open(Client, Endpoints) ->
     open(Client, Endpoints, #{}).
 
+%% @doc Open a client and connect to the members of the etcd cluster.
+%%
+%% Returns `{error, no_credentials}' if the etcd server requires authentication but no `cred' is
+%% given.
 -spec open(client(), [endpoint()], opts()) -> {ok, pid()} | {error, Reason :: term()}.
 open(Client, Endpoints, Opts) ->
     etcdgun_client_sup:start_child(Client, Endpoints, Opts).

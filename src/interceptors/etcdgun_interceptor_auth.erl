@@ -32,14 +32,10 @@ authenticate(Stream, Req, Opts, Next) ->
     %%   Lease.* (with LeaseKeepAlive)    -       -       token
     %%
     %% The token is always accepted, even by the RPCs which do not require it, so it is sent to all
-    %% of them except `Auth.Authenticate', which is how the token is obtained.
-    %%
-    %% TODO: `Cluster.MemberList' is still excluded, because it is called to discover the members
-    %% before the client has a token. etcd 3.7 requires a token for it, so the client can not be
-    %% started against etcd 3.7 with authentication enabled.
+    %% of them except `Auth.Authenticate', which is how the token is obtained. When there is no
+    %% token in the channel info yet, e.g. the authentication is not enabled, nothing is sent.
     ShouldAuth =
         case {string:split(Service, ".", all), Method} of
-                {["etcdserverpb", "Cluster"], 'MemberList'} -> false;
                 {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
                 {["etcdserverpb", _], _} -> true;
                 {["v3electionpb", _], _} -> true;

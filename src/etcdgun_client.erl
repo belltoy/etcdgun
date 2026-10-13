@@ -79,8 +79,14 @@ unset_cred(Client) ->
 -spec refresh_token(etcdgun:client()) ->
     {ok, NewToken :: binary()} | {error, no_credentials | auth_not_enabled | term()}.
 refresh_token(Client) ->
-    % eqwalizer:ignore
-    gen_server:call(Client, refresh_token).
+    %% The interceptor may call this from the client process itself, e.g. when checking the members
+    %% while connecting. Calling itself would crash with `calling_self'.
+    case Client =:= self() orelse (is_atom(Client) andalso whereis(Client) =:= self()) of
+        true -> {error, in_client_process};
+        false ->
+            % eqwalizer:ignore
+            gen_server:call(Client, refresh_token)
+    end.
 
 -spec pick_channel(etcdgun:client() | pid()) ->
     {ok, egrpc:channel()} |
@@ -121,15 +127,10 @@ init({Client, Endpoints, Opts0}) ->
         end,
     Opts = maps:with([stream_interceptors, unary_interceptors], Opts0),
     maybe
-        {ok, Members} ?= get_member_list(Client, shuffle(Endpoints), Opts),
-        {ok, Actives, Errors} ?= open_and_wait_members(Client, Members, Opts, [], []),
-        {ok, Token} ?=
-            case auth(Actives, Cred) of
-                {error, {etcd_error, auth_not_enabled}} ->
-                    ?LOG_WARNING("Authentication is not enabled on the etcd server, skipping"),
-                    {ok, undefined};
-                R -> R
-            end,
+        %% Authenticate first, the RPCs of getting the members and checking them require the token
+        %% in etcd 3.6 and 3.7 when authentication is enabled.
+        {ok, Members, Token} ?= get_member_list(Client, shuffle(Endpoints), Cred, Opts),
+        {ok, Actives, Errors} ?= open_and_wait_members(Client, Members, Token, Opts, [], []),
         % {ok, _Pid} ?= etcdgun_membership:start_link(Client),
         ?LOG_INFO(#{
             msg =>"Connected to etcd",
@@ -248,6 +249,9 @@ handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
     erlang:demonitor(MRef, [flush]),
     {noreply, handle_gun_down(GunPid, Reason, State)};
 
+handle_info({token_renewed, Token}, State) ->
+    {noreply, State#state{token = Token}};
+
 handle_info({check, Result, Elem}, State) ->
     {noreply, handle_check_result(Result, Elem, State)};
 
@@ -340,20 +344,52 @@ start_membership_timer(#state{membership_check_interval = infinity} = State) ->
 cancel_retry_timer(#state{retry_tref = undefined}) -> ok;
 cancel_retry_timer(#state{retry_tref = TRef}) -> erlang:cancel_timer(TRef).
 
-get_member_list(_Client, [], _Opts) -> {error, no_available_endpoints};
-get_member_list(Client, [{Host, Port} | Rest], Opts) ->
+%% Authenticate with the credentials and get the member list, return the token too.
+get_member_list(_Client, [], _Cred, _Opts) -> {error, no_available_endpoints};
+get_member_list(Client, [{Host, Port} | Rest], Cred, Opts) ->
     with_channel(Host, Port, Opts, fun(Channel) ->
-        case do_get_member_list(Channel) of
-            {ok, []} ->
-                ?LOG_WARNING("No members found in etcd cluster at ~s:~p", [Host, Port]),
-                get_member_list(Client, Rest, Opts);
-            {ok, Members} -> {ok, Members};
+        case authenticate_bootstrap(Channel, Cred) of
+            {ok, Token} ->
+                case do_get_member_list(with_token(Channel, Token)) of
+                    {ok, []} ->
+                        ?LOG_WARNING("No members found in etcd cluster at ~s:~p", [Host, Port]),
+                        get_member_list(Client, Rest, Cred, Opts);
+                    {ok, Members} -> {ok, Members, Token};
+                    {error, Reason} ->
+                        case is_auth_required(Token, Reason) of
+                            true ->
+                                {error, no_credentials};
+                            false ->
+                                ?LOG_WARNING("Failed to connect to etcd endpoint: ~s:~p, "
+                                             "reason: ~p", [Host, Port, Reason]),
+                                get_member_list(Client, Rest, Cred, Opts)
+                        end
+                end;
+            {error, {etcd_error, _}} = Error ->
+                %% Rejected by the server, e.g. wrong password, other endpoints will do the same.
+                Error;
             {error, Reason} ->
-                ?LOG_WARNING("Failed to connect to etcd endpoint: ~s:~p, reason: ~p",
+                ?LOG_WARNING("Failed to authenticate on etcd endpoint: ~s:~p, reason: ~p",
                              [Host, Port, Reason]),
-                get_member_list(Client, Rest, Opts)
+                get_member_list(Client, Rest, Cred, Opts)
         end
     end).
+
+authenticate_bootstrap(Channel, Cred) ->
+    case authenticate(Channel, Cred) of
+        {error, {etcd_error, auth_not_enabled}} ->
+            ?LOG_WARNING("Authentication is not enabled on the etcd server, skipping"),
+            {ok, undefined};
+        Result -> Result
+    end.
+
+%% Put the token into the channel info, the auth interceptors send it with the requests.
+with_token(Channel, undefined) -> Channel;
+with_token(Channel, Token) ->
+    OldInfo = egrpc_stub:info(Channel, #{}),
+    %% eqwalizer:ignore
+    NewInfo = OldInfo#{token => Token},
+    egrpc_stub:set_info(Channel, NewInfo).
 
 with_channel(Host, Port, Opts, Fun) ->
     maybe
@@ -377,25 +413,43 @@ usable_members(Members) ->
 is_learner(#{isLearner := IsLearner}) -> IsLearner =:= true orelse IsLearner =:= 1;
 is_learner(#{}) -> false.
 
-open_and_wait_members(_Client, [], _Opts, [], _Errors) -> {error, no_available_endpoints};
-open_and_wait_members(_Client, [], _Opts, Success, Errors) -> {ok, Success, Errors};
-open_and_wait_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success, Errors) ->
+open_and_wait_members(_Client, [], _Token, _Opts, [], _Errors) ->
+    {error, no_available_endpoints};
+open_and_wait_members(_Client, [], _Token, _Opts, Success, Errors) -> {ok, Success, Errors};
+open_and_wait_members(Client, [#{'ID' := Id} = Member | Rest], Token, Opts, Success, Errors) ->
     maybe
         #{clientURLs := [ClientUrl | _]} = Member,
         {ok, Host, Port, _Transport} ?= parse_client_url(ClientUrl),
         {ok, Channel} ?= open_and_wait(Host, Port, Opts#{info => #{client => Client}}),
-        ok ?= check_health(Channel),
-        ok ?= check_leader(Channel),
+        ok ?= close_on_error(Channel, check_endpoint(with_token(Channel, Token))),
         GunPid = egrpc_stub:conn_pid(Channel),
         MRef = erlang:monitor(process, GunPid),
-        open_and_wait_members(Client, Rest, Opts, [{Id, Channel, MRef} | Success], Errors)
+        open_and_wait_members(Client, Rest, Token, Opts, [{Id, Channel, MRef} | Success], Errors)
     else
         {error, Reason} ->
-            ?LOG_WARNING(#{msg =>"Failed to connect to etcd member",
-                           member => Member,
-                           reason => Reason}),
-            open_and_wait_members(Client, Rest, Opts, Success, [Id | Errors])
+            case is_auth_required(Token, Reason) of
+                true ->
+                    %% The other members are the same, give up.
+                    [ensure_close(Elem) || Elem <- Success],
+                    {error, no_credentials};
+                false ->
+                    ?LOG_WARNING(#{msg =>"Failed to connect to etcd member",
+                                   member => Member,
+                                   reason => Reason}),
+                    open_and_wait_members(Client, Rest, Token, Opts, Success, [Id | Errors])
+            end
     end.
+
+close_on_error(_Channel, ok) -> ok;
+close_on_error(Channel, {error, _} = Error) ->
+    egrpc_stub:close(Channel),
+    Error.
+
+%% The server requires the token, but there is no one, i.e. no credentials configured.
+is_auth_required(undefined, {grpc_error, _, _} = Reason) ->
+    is_auth_required(undefined, etcdgun_error:from_grpc_error(Reason));
+is_auth_required(undefined, Reason) -> Reason =:= {etcd_error, user_empty};
+is_auth_required(_Token, _Reason) -> false.
 
 open_and_wait(Host, Port, Opts) ->
     maybe
@@ -415,7 +469,11 @@ open_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success) ->
 
 auth(_Channels, undefined) -> {ok, undefined};
 auth([], _Cred) -> {error, no_available_connection};
-auth([{_MemberId, Channel, _MRef} | _], {Username, Password}) ->
+auth([{_MemberId, Channel, _MRef} | _], Cred) ->
+    authenticate(Channel, Cred).
+
+authenticate(_Channel, undefined) -> {ok, undefined};
+authenticate(Channel, {Username, Password}) ->
     maybe
         Req = #{name => Username, password => Password},
         {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_client:authenticate(Channel, Req),
@@ -460,7 +518,8 @@ handle_gun_up(GunPid, #state{connectings = Connectings} = State) ->
     case lists:search(fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end, Connectings) of
         {value, {_MemberId, Channel, _MRef} = Elem} ->
             Self = self(),
-            spawn(fun() -> Self ! {check, check_endpoint(Channel), Elem} end),
+            #state{token = Token, cred = Cred} = State,
+            spawn(fun() -> Self ! {check, check_connecting(Self, Channel, Token, Cred), Elem} end),
             State;
         false ->
             ?LOG_WARNING("Received gun_up for unknown connection: ~p", [GunPid]),
@@ -486,6 +545,23 @@ handle_gun_down(GunPid, Reason, #state{actives = Actives, connectings = Connecti
             State#state{connectings = lists:delete(Elem, Connectings)};
         {false, false} ->
             State
+    end.
+
+%% Check a connecting channel with the token. If it fails, the token may be invalid, e.g. the member
+%% was restarted and lost the token. Refreshing the token through the active channels does not work
+%% when this is the only member, so authenticate on this channel and check again.
+check_connecting(Client, Channel, Token, Cred) ->
+    case check_endpoint(with_token(Channel, Token)) of
+        {error, _} = Error when Cred =/= undefined ->
+            maybe
+                {ok, NewToken} ?= authenticate(Channel, Cred),
+                ok ?= check_endpoint(with_token(Channel, NewToken)),
+                Client ! {token_renewed, NewToken},
+                ok
+            else
+                _ -> Error
+            end;
+        Result -> Result
     end.
 
 check_endpoint(Channel) ->
@@ -532,5 +608,16 @@ usable_members_test() ->
     ?assertEqual([Started, NoLearnerKey],
                  usable_members([Started, Learner, Unstarted, NoLearnerKey])),
     ?assertEqual([], usable_members([])),
+    ok.
+
+is_auth_required_test() ->
+    UserEmpty = {grpc_error, invalid_argument, <<"etcdserver: user name is empty">>},
+    ?assert(is_auth_required(undefined, {etcd_error, user_empty})),
+    ?assert(is_auth_required(undefined, UserEmpty)),
+    %% Has the token, or other errors.
+    ?assertNot(is_auth_required(<<"token">>, {etcd_error, user_empty})),
+    ?assertNot(is_auth_required(undefined, {etcd_error, invalid_auth_token})),
+    ?assertNot(is_auth_required(undefined, {grpc_error, unavailable, <<"etcdserver: no leader">>})),
+    ?assertNot(is_auth_required(undefined, timeout)),
     ok.
 -endif.
