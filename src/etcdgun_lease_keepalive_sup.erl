@@ -29,11 +29,8 @@ start_child(Client, LeaseId, RevokeWhenShutdown) ->
     end.
 
 stop_child(Client, LeaseId) ->
-    case supervisor:terminate_child(?SERVER, {Client, LeaseId}) of
-        ok ->
-            ok = supervisor:delete_child(?SERVER, {Client, LeaseId});
-        {error, not_found} = E -> E
-    end.
+    %% The child is `temporary', its spec is gone once it is terminated.
+    supervisor:terminate_child(?SERVER, {Client, LeaseId}).
 
 init([]) ->
     SupFlags = #{

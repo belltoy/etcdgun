@@ -16,12 +16,13 @@ Erlang gRPC client for etcd v3 (229 source files). Auto-generates gRPC service s
 | Command | Purpose |
 |---------|---------|
 | `rebar3 compile` | Build with code generation (proto → egrpc → compile) |
-| `rebar3 eunit` | Run embedded tests (1 test in src/etcdgun.erl) |
+| `rebar3 eunit` | Run embedded tests (in src/etcdgun.erl and src/etcdgun_client.erl) |
+| `rebar3 ct` | Integration tests in `test/etcdgun_SUITE.erl`, need the etcd cluster of `just etcd`; skipped if it is not reachable |
 | `rebar3 fmt -w` | Format code with erlfmt |
 | `rebar3 dialyzer` | Static type analysis (Erlang 26.2 compatible) |
 | `rebar3 ex_doc` | Generate hexdocs documentation |
 
-Run in sequence for full verification. No separate test suite; only inline eunit tests.
+Run in sequence for full verification. The CT suite assumes the dev cluster has authentication enabled with `root`/`123456`.
 
 ## Dev Environment
 
@@ -70,7 +71,8 @@ just clean         # Cleans persistent data (data/etcd-{1,2,3})
 **Dev & Testing:**
 - Integration tests require running etcd cluster (`just etcd`)
 - Dev config hardcodes auth for testing; change via `etcdgun_client:update_cred/3` at runtime
-- Only 1 inline eunit test; no external test suite or CI workflows
+- A few inline eunit tests and one CT suite (`rebar3 ct`); no CI workflows
+- `just etcd-down` removes the cluster containers, the data in `data/` is kept
 
 **Tool Versions** (from .mise.toml):
 - Erlang 26.2, Rebar 3.24.0, ELP otp-26

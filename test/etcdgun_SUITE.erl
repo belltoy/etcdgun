@@ -1,0 +1,241 @@
+%% Integration tests against the etcd cluster of `just etcd' (docker-compose, v3.5.10), which has
+%% authentication enabled with the user `root' and the password `123456'. The suite is skipped when
+%% the cluster is not reachable.
+-module(etcdgun_SUITE).
+
+-include_lib("stdlib/include/assert.hrl").
+
+-export([all/0, init_per_suite/1, end_per_suite/1, init_per_testcase/2, end_per_testcase/2]).
+
+-export([
+    no_credentials/1,
+    wrong_password/1,
+    kv_and_cluster/1,
+    update_and_unset_cred/1,
+    token_refresh/1,
+    watch_events/1,
+    watch_reconnect/1,
+    lease_keepalive/1,
+    membership_sync/1
+]).
+
+-define(CLIENT, etcdgun_ct).
+-define(ENDPOINTS, [{"127.0.0.1", 2379}, {"127.0.0.1", 2479}, {"127.0.0.1", 2579}]).
+-define(CRED, {"root", "123456"}).
+-define(TOKEN_TABLE, etcdgun_client_tokens).
+
+all() ->
+    [
+        no_credentials,
+        wrong_password,
+        kv_and_cluster,
+        update_and_unset_cred,
+        token_refresh,
+        watch_events,
+        watch_reconnect,
+        lease_keepalive,
+        membership_sync
+    ].
+
+init_per_suite(Config) ->
+    case gen_tcp:connect("127.0.0.1", 2379, [], 1000) of
+        {ok, Sock} ->
+            gen_tcp:close(Sock),
+            {ok, _} = application:ensure_all_started(etcdgun),
+            Config;
+        {error, _} ->
+            {skip, no_etcd}
+    end.
+
+end_per_suite(_Config) ->
+    application:stop(etcdgun),
+    ok.
+
+init_per_testcase(Case, Config) when Case =:= no_credentials; Case =:= wrong_password ->
+    Config;
+init_per_testcase(_Case, Config) ->
+    Opts = #{
+        cred => ?CRED,
+        membership_check_interval => infinity,
+        interceptors => [fun etcdgun_interceptor_auth:refresh_token/4]
+    },
+    {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts),
+    Config.
+
+end_per_testcase(_Case, _Config) ->
+    _ = etcdgun:close(?CLIENT),
+    ok.
+
+%%-------------------------------------------------------------------
+%% Test cases
+%%-------------------------------------------------------------------
+
+%% etcd 3.5 does not require the token for the member list and the status, which is all the
+%% client needs to open, but the KV requests are rejected. Newer versions refuse to open.
+no_credentials(_Config) ->
+    {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, #{membership_check_interval => infinity}),
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    ?assertMatch({error, _}, etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})),
+    ok = etcdgun:close(?CLIENT).
+
+wrong_password(_Config) ->
+    Res = open_without_cred(#{cred => {"root", "wrong-password"}}),
+    ?assertMatch({error, _}, Res).
+
+kv_and_cluster(_Config) ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Key = key(),
+    {ok, _} = etcdgun_etcdserverpb_kv_client:put(Channel, #{key => Key, value => <<"v1">>}),
+    {ok, #{kvs := [#{value := <<"v1">>}]}} =
+        etcdgun_etcdserverpb_kv_client:range(Channel, #{key => Key}),
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+    ?assertEqual(3, length(Members)),
+    {ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}),
+    {ok, Info} = etcdgun_client:client_info(?CLIENT),
+    ?assertMatch(#{actives := 3, token := <<_/binary>>}, Info).
+
+%% The token of a wrong password is not taken, the old one is kept.
+update_and_unset_cred(_Config) ->
+    {ok, #{token := Token0}} = etcdgun_client:client_info(?CLIENT),
+    ?assertMatch({error, _}, etcdgun_client:update_cred(?CLIENT, <<"root">>, <<"nope">>)),
+    {ok, #{token := Token0}} = etcdgun_client:client_info(?CLIENT),
+    ok = etcdgun_client:update_cred(?CLIENT, <<"root">>, <<"123456">>),
+    {ok, #{token := Token1}} = etcdgun_client:client_info(?CLIENT),
+    ?assert(is_binary(Token1)),
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+    %% Without the credentials the token is dropped, so the server rejects the request.
+    ok = etcdgun_client:unset_cred(?CLIENT),
+    {ok, #{token := undefined}} = etcdgun_client:client_info(?CLIENT),
+    ?assertEqual(undefined, etcdgun_client:cached_token(?CLIENT)),
+    {ok, Channel1} = etcdgun_client:pick_channel(?CLIENT),
+    ?assertMatch({error, _}, etcdgun_etcdserverpb_kv_client:range(Channel1, #{key => key()})).
+
+%% An invalid token is refreshed by the interceptor and the request is retried. A channel which
+%% was picked before the refresh sends the new token afterwards.
+token_refresh(_Config) ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, Token0} = etcdgun_client:cached_token(?CLIENT),
+    ets:insert(?TOKEN_TABLE, {?CLIENT, <<"invalid.token">>}),
+    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+    {ok, Token1} = etcdgun_client:cached_token(?CLIENT),
+    ?assertNotEqual(<<"invalid.token">>, Token1),
+    ?assertNotEqual(Token0, Token1),
+    %% The same channel keeps working with the new token.
+    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}).
+
+watch_events(_Config) ->
+    Prefix = key(),
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    Key = <<Prefix/binary, "/a">>,
+    put_retry(Key, <<"1">>),
+    ?assertMatch([#{kv := #{key := Key, value := <<"1">>}}], recv_events()),
+    put_retry(Key, <<"2">>),
+    ?assertMatch([#{kv := #{key := Key, value := <<"2">>}}], recv_events()),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% The watcher is restarted when its connection is down, and resumes from the last revision, so
+%% the event which happened while it was down is not lost.
+watch_reconnect(_Config) ->
+    Prefix = key(),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    A = <<Prefix/binary, "/a">>,
+    B = <<Prefix/binary, "/b">>,
+    put_retry(A, <<"1">>),
+    ?assertMatch([#{kv := #{key := A}}], recv_events()),
+    {monitors, [{process, ConnPid}]} = process_info(Pid, monitors),
+    exit(ConnPid, kill),
+    put_retry(B, <<"2">>),
+    ?assertMatch([#{kv := #{key := B}}], recv_events(15000)),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+lease_keepalive(_Config) ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{'ID' := LeaseId}} =
+        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 3}),
+    {ok, _} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, true),
+    %% Longer than the TTL, the lease is alive only because of the keepalive.
+    timer:sleep(6000),
+    {ok, #{'TTL' := TTL}} =
+        etcdgun_etcdserverpb_lease_client:lease_time_to_live(Channel, #{'ID' => LeaseId}),
+    ?assert(TTL > 0),
+    %% Revoked when the keepalive is stopped, `-1' is a lease which does not exist.
+    ok = etcdgun_lease_keepalive_sup:stop_child(?CLIENT, LeaseId),
+    {ok, #{'TTL' := -1}} =
+        etcdgun_etcdserverpb_lease_client:lease_time_to_live(Channel, #{'ID' => LeaseId}).
+
+%% Members which are not in the membership anymore are dropped, and come back when they are
+%% added again.
+membership_sync(_Config) ->
+    {ok, #{members := Members, actives := 3}} = etcdgun_client:client_info(?CLIENT),
+    ?assertEqual(3, length(Members)),
+    [_ | Rest] = Members,
+    ok = etcdgun_client:sync_membership(?CLIENT, Rest),
+    ok = wait_until(fun() ->
+        {ok, #{actives := N, members := Ms}} = etcdgun_client:client_info(?CLIENT),
+        N =:= 2 andalso length(Ms) =:= 2
+    end),
+    ok = etcdgun_client:sync_membership(?CLIENT, Members),
+    ok = wait_until(fun() ->
+        {ok, #{actives := N, members := Ms}} = etcdgun_client:client_info(?CLIENT),
+        N =:= 3 andalso length(Ms) =:= 3
+    end),
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}).
+
+%%-------------------------------------------------------------------
+%% Helpers
+%%-------------------------------------------------------------------
+
+open_without_cred(Opts) ->
+    Res = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts#{membership_check_interval => infinity}),
+    _ = etcdgun:close(?CLIENT),
+    Res.
+
+key() ->
+    iolist_to_binary(["/etcdgun_ct/", integer_to_binary(erlang:unique_integer([positive]))]).
+
+watch_req(Prefix) ->
+    #{request_union => {create_request, #{
+        key => Prefix,
+        range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix))
+    }}}.
+
+%% The watch events of one `watch_events' message.
+recv_events() -> recv_events(5000).
+
+recv_events(Timeout) ->
+    receive
+        {watch_event, {watch_events, Events}} -> Events;
+        {watch_event, _Other} -> recv_events(Timeout)
+    after Timeout ->
+        ct:fail(no_watch_events)
+    end.
+
+%% A put through a channel which may be being replaced, e.g. right after a connection was killed.
+put_retry(Key, Value) ->
+    put_retry(Key, Value, 20).
+
+put_retry(_Key, _Value, 0) ->
+    ct:fail(put_failed);
+put_retry(Key, Value, N) ->
+    Res =
+        case etcdgun_client:pick_channel(?CLIENT) of
+            {ok, Channel} ->
+                etcdgun_etcdserverpb_kv_client:put(Channel, #{key => Key, value => Value});
+            {error, _} = Error ->
+                Error
+        end,
+    case Res of
+        {ok, _} -> ok;
+        {error, _} -> timer:sleep(500), put_retry(Key, Value, N - 1)
+    end.
+
+wait_until(Fun) -> wait_until(Fun, 40).
+
+wait_until(_Fun, 0) -> ct:fail(timeout);
+wait_until(Fun, N) ->
+    case Fun() of
+        true -> ok;
+        false -> timer:sleep(500), wait_until(Fun, N - 1)
+    end.

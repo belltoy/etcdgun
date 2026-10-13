@@ -350,13 +350,14 @@ start_retry_timer(State) ->
     TRef = erlang:start_timer(?RETRY_INTERVAL, self(), retry),
     State#state{retry_tref = TRef}.
 
-start_membership_timer(#state{membership_check_interval = Interval} = State) when Interval > 0 ->
-    TRef = erlang:start_timer(Interval, self(), check_membership),
-    State#state{membership_tref = TRef};
+%% `infinity' first: as a term, the atom is greater than any integer.
+start_membership_timer(#state{membership_check_interval = infinity} = State) ->
+    State;
 start_membership_timer(#state{membership_check_interval = 0} = State) ->
     State;
-start_membership_timer(#state{membership_check_interval = infinity} = State) ->
-    State.
+start_membership_timer(#state{membership_check_interval = Interval} = State) when Interval > 0 ->
+    TRef = erlang:start_timer(Interval, self(), check_membership),
+    State#state{membership_tref = TRef}.
 
 cancel_retry_timer(#state{retry_tref = undefined}) -> ok;
 cancel_retry_timer(#state{retry_tref = TRef}) -> erlang:cancel_timer(TRef).

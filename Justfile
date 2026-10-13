@@ -12,3 +12,7 @@ _prepare-etcd-dirs:
 
 etcd: _prepare-etcd-dirs
     @docker compose up
+
+# Stop and remove the etcd cluster containers, the data is kept
+etcd-down:
+    @docker compose down
