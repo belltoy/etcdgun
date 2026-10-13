@@ -53,6 +53,16 @@
 client_info(Client) ->
     gen_server:call(Client, client_info).
 
+%% @doc Update the credentials of the client and authenticate with them.
+%%
+%% On success, the new credentials and the new token replace the old ones, and the new token is
+%% used by the following requests.
+%%
+%% If the etcd server does not enable authentication, the credentials are updated and the token is
+%% unset, `ok' is returned.
+%%
+%% On failure, for example a wrong password or no available connection, the old credentials and
+%% the old token are kept, and `{error, Reason}' is returned.
 -spec update_cred(etcdgun:client(), Username, Password) -> ok | {error, term()} when
     Username :: binary(),
     Password :: binary().
@@ -197,7 +207,7 @@ handle_call({update_cred, {Username, _Password} = Cred}, _From, #state{cred = _C
         {error, Reason} ->
             ?LOG_ERROR("Failed to update credentials for client ~p: ~p",
                       [State#state.name, Reason]),
-            {reply, {error, Reason}, State#state{cred = Cred, token = undefined}}
+            {reply, {error, Reason}, State}
     end;
 
 handle_call(_Request, _From, State) ->
@@ -397,6 +407,7 @@ open_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success) ->
     end.
 
 auth(_Channels, undefined) -> {ok, undefined};
+auth([], _Cred) -> {error, no_available_connection};
 auth([{_MemberId, Channel, _MRef} | _], {Username, Password}) ->
     maybe
         Req = #{name => Username, password => Password},
