@@ -38,12 +38,23 @@
       interceptors => [egrpc_interceptor:spec()]
 }.
 
+%% @doc The information of the clients which are running.
 clients() ->
-    Clients = [
-        etcdgun_client:client_info(Pid)
-     || {_, Pid, _, _} <- supervisor:which_children(etcdgun_client_sup)
-    ],
+    Children = supervisor:which_children(etcdgun_client_sup),
+    Clients = [client_info(Pid) || Pid <- client_pids(Children)],
     [Info || {ok, Info} <- Clients].
+
+%% A child which is being restarted has no pid (`restarting'), nor one which is not started.
+client_pids(Children) ->
+    [Pid || {_Id, Pid, _Type, _Modules} <- Children, is_pid(Pid)].
+
+%% The client may be gone since the list was taken.
+client_info(Pid) ->
+    try
+        etcdgun_client:client_info(Pid)
+    catch
+        exit:_ -> {error, not_running}
+    end.
 
 %% @doc Equivalent to `open(Client, Endpoints, #{})', see `open/3'.
 -spec open(client(), [endpoint()]) -> {ok, pid()} | {error, Reason :: term()}.
@@ -74,9 +85,12 @@ cancel_watch(Client, WatcherName) ->
 -define(UNBOUND_RANGE_END, "\0").
 
 %% @doc Given a etcd key, return the end key for a prefix range.
--spec prefix_range_end(Key :: binary() | string()) -> string().
+%%
+%% The result has the type of the key: a binary for a binary and a string for a string.
+-spec prefix_range_end(Key :: binary()) -> binary();
+                      (Key :: string()) -> string().
 prefix_range_end(Key) when is_binary(Key) ->
-    prefix_range_end(binary_to_list(Key));
+    list_to_binary(prefix_range_end(binary_to_list(Key)));
 
 prefix_range_end(Key) when is_list(Key) ->
     RangeEndRev = lists:reverse(Key),
@@ -87,6 +101,21 @@ find_prefix_rev([H | T]) when H < 255 -> [H + 1 | T];
 find_prefix_rev([_ | T]) -> find_prefix_rev(T).
 
 -ifdef(TEST).
+client_pids_test() ->
+    Pid = self(),
+    Children = [{a, Pid, worker, [m]}, {b, restarting, worker, [m]}, {c, undefined, worker, [m]}],
+    ?assertEqual([Pid], client_pids(Children)),
+    ?assertEqual([], client_pids([])).
+
+prefix_range_end_binary_test() ->
+    ?assertEqual(<<"b">>, prefix_range_end(<<"a">>)),
+    ?assertEqual(<<"ab">>, prefix_range_end(<<"aa">>)),
+    ?assertEqual(<<"a\x02">>, prefix_range_end(<<"a\x01">>)),
+    ?assertEqual(<<"b">>, prefix_range_end(<<"a\xff">>)),
+    ?assertEqual(<<0>>, prefix_range_end(<<>>)),
+    ?assertEqual(<<0>>, prefix_range_end(<<255, 255>>)),
+    ?assert(is_binary(prefix_range_end(<<"/etcdgun_ct/1/">>))).
+
 get_prefix_range_end_test() ->
     ?assertEqual(?UNBOUND_RANGE_END, prefix_range_end([])),
     ?assertEqual("b", prefix_range_end("a")),

@@ -34,20 +34,22 @@ call_credentials(Stream) ->
     %% The token is always accepted, even by the RPCs which do not require it, so it is sent to all
     %% of them except `Auth.Authenticate', which is how the token is obtained. When there is no
     %% token yet, e.g. the authentication is not enabled, nothing is sent.
-    ShouldAuth =
-        case {string:split(atom_to_list(Service), ".", all), Method} of
-            {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
-            {["etcdserverpb", _], _} -> true;
-            {["v3electionpb", _], _} -> true;
-            {["v3lockpb", _], _} -> true;
-            {_, _} -> false
-        end,
-    case ShouldAuth andalso get_token(Stream) of
+    case should_auth(Service, Method) andalso get_token(Stream) of
         {ok, Token} ->
             ?LOG_DEBUG("Authenticating RPC ~s.~s", [Service, Method]),
             {ok, #{<<"token">> => Token}};
         _ ->
             {ok, #{}}
+    end.
+
+%% Whether the RPC gets the token: the services of etcd, except `Auth.Authenticate'.
+should_auth(Service, Method) ->
+    case {string:split(atom_to_list(Service), ".", all), Method} of
+        {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
+        {["etcdserverpb", _], _} -> true;
+        {["v3electionpb", _], _} -> true;
+        {["v3lockpb", _], _} -> true;
+        {_, _} -> false
     end.
 
 %% The token of the channel info is for the channels which are not opened by a client yet, e.g.
@@ -96,3 +98,33 @@ refresh_token(Stream) ->
         #{client := Client} when is_atom(Client) -> etcdgun_client:refresh_token(Client);
         _ -> {error, not_a_client}
     end.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+%% Which RPCs get the token. The Lease RPCs are in, `LeaseRevoke' checks the permissions of the
+%% keys of the lease, and etcd 3.7 requires the token for all of them.
+should_auth_test() ->
+    Yes = [
+        {'etcdserverpb.KV', 'Range'},
+        {'etcdserverpb.KV', 'Put'},
+        {'etcdserverpb.Watch', 'Watch'},
+        {'etcdserverpb.Lease', 'LeaseGrant'},
+        {'etcdserverpb.Lease', 'LeaseRevoke'},
+        {'etcdserverpb.Lease', 'LeaseKeepAlive'},
+        {'etcdserverpb.Lease', 'LeaseTimeToLive'},
+        {'etcdserverpb.Lease', 'LeaseLeases'},
+        {'etcdserverpb.Cluster', 'MemberList'},
+        {'etcdserverpb.Maintenance', 'Status'},
+        {'etcdserverpb.Auth', 'UserAdd'},
+        {'v3electionpb.Election', 'Campaign'},
+        {'v3lockpb.Lock', 'Lock'}
+    ],
+    No = [
+        {'etcdserverpb.Auth', 'Authenticate'},
+        {'grpc.health.v1.Health', 'Check'},
+        {'grpc.reflection.v1.ServerReflection', 'ServerReflectionInfo'}
+    ],
+    [?assert(should_auth(S, M)) || {S, M} <- Yes],
+    [?assertNot(should_auth(S, M)) || {S, M} <- No].
+-endif.

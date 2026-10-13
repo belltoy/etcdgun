@@ -13,8 +13,12 @@ start_link() ->
     supervisor:start_link({local, ?SERVER}, ?MODULE, []).
 
 init([]) ->
+    %% The subtrees are independent: a restart of one is not a reason to drop the connections,
+    %% the watches and the lease keepalives of the others, which are not started again by a
+    %% supervisor which is restarted (they are dynamic children), the lease keepalives are
+    %% not restarted at all. The clients and the watchers notice that a connection is gone.
     SupFlags = #{
-        strategy => one_for_all,
+        strategy => one_for_one,
         intensity => 1,
         period => 5
     },

@@ -44,7 +44,8 @@ init({Client, LeaseId, RevokeWhenShutdown}) ->
         {ok, State} -> {ok, State};
         {error, Reason} ->
             ?LOG_ERROR("Failed to start keepalive for lease ~p: ~p", [LeaseId, Reason]),
-            {error, Reason}
+            %% `{error, _}' is not a return of init/1, it would hide the reason.
+            {stop, Reason}
     end.
 
 handle_call(_Request, _From, State) ->

@@ -23,8 +23,17 @@
     member_down/1,
     member_add_remove/1,
     learner_member/1,
-    leader_change/1
+    leader_change/1,
+    watch_many_creates/1,
+    watch_recreate_same_name/1,
+    watch_replay_from_start/1,
+    watch_without_connection/1,
+    keepalive_unknown_lease/1,
+    keepalive_lease_gone/1,
+    one_subtree_crash/1
 ]).
+
+
 
 -define(CLIENT, etcdgun_ct).
 -define(ENDPOINTS, [{"127.0.0.1", 2379}, {"127.0.0.1", 2479}, {"127.0.0.1", 2579}]).
@@ -48,8 +57,17 @@ all() ->
         member_down,
         member_add_remove,
         learner_member,
-        leader_change
+        leader_change,
+        watch_many_creates,
+        watch_recreate_same_name,
+        watch_replay_from_start,
+        watch_without_connection,
+        keepalive_unknown_lease,
+        keepalive_lease_gone,
+        one_subtree_crash
     ].
+
+
 
 init_per_suite(Config) ->
     case gen_tcp:connect("127.0.0.1", 2379, [], 1000) of
@@ -88,6 +106,8 @@ open_client(Interval, Config) ->
     Config.
 
 end_per_testcase(_Case, _Config) ->
+    %% A watcher which is left by a failed case has the same name in the next one.
+    [_ = etcdgun:cancel_watch(?CLIENT, Name) || Name <- [ct_watcher, ct_watcher2]],
     _ = etcdgun:close(?CLIENT),
     ok.
 
@@ -329,6 +349,143 @@ learner_member(_Config) ->
         ok = wait_until({three, Ctl}, fun() -> members() =:= 3 andalso actives() =:= 3 end, 90)
     end).
 
+%% Several watches are created by one watcher, their create responses arrive together. They all
+%% have to be handled, or the watcher stops after the create timeout.
+watch_many_creates(_Config) ->
+    Prefix = key(),
+    %% The trailing slash: `/1' would also be the prefix of `/10' and `/100'.
+    Prefixes = [<<Prefix/binary, "/", (integer_to_binary(I))/binary, "/">> || I <- lists:seq(1, 100)],
+    Reqs = [watch_req(P) || P <- Prefixes],
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), Reqs),
+    %% Longer than the create timeout of the watcher.
+    timer:sleep(6500),
+    ?assert(is_process_alive(Pid)),
+    [put_retry(<<P/binary, "k">>, <<"v">>) || P <- Prefixes],
+    Keys = lists:sort([<<P/binary, "k">> || P <- Prefixes]),
+    ?assertEqual(Keys, lists:sort(recv_keys(length(Keys), 10000))),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% The watcher of a name which was cancelled starts from what the request says, not from the last
+%% revision of the former one.
+watch_recreate_same_name(_Config) ->
+    Prefix = key(),
+    A = <<Prefix/binary, "/a">>,
+    B = <<Prefix/binary, "/b">>,
+    C = <<Prefix/binary, "/c">>,
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    Rev = put_retry(A, <<"1">>),
+    put_retry(B, <<"2">>),
+    ?assertEqual([A, B], recv_keys(2, 5000)),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher),
+    put_retry(C, <<"3">>),
+    %% All the events since the first put are expected again.
+    Req = #{request_union => {create_request, #{
+        key => Prefix,
+        range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix)),
+        start_revision => Rev
+    }}},
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [Req]),
+    ?assertEqual([A, B, C], recv_keys(3, 5000)),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% A watch which starts at an old revision gets the events of the history in several responses
+%% (etcd sends at most 1000 revisions at a time), and a reconnection in the middle resumes without
+%% a gap or a duplicate: from the revision of the last event, not from the header of the response,
+%% which is the current revision of the store.
+watch_replay_from_start(_Config) ->
+    Prefix = key(),
+    Keys = [<<Prefix/binary, "/", (integer_to_binary(I))/binary>> || I <- lists:seq(1000, 3499)],
+    [Rev | _] = [put_retry(K, <<"v">>) || K <- Keys],
+    Req = #{request_union => {create_request, #{
+        key => Prefix,
+        range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix)),
+        start_revision => Rev
+    }}},
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [Req]),
+    First = recv_keys(1, 10000),
+    ?assert(length(First) < length(Keys)),
+    %% The connection is lost while the history is being sent.
+    {monitors, [{process, ConnPid}]} = process_info(Pid, monitors),
+    exit(ConnPid, kill),
+    Rest = recv_keys(length(Keys) - length(First), 30000),
+    ?assertEqual(Keys, First ++ Rest),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% A lease which does not exist: the start is refused with the reason, not with a
+%% `bad_return_value' of the init function.
+keepalive_unknown_lease(_Config) ->
+    ?assertEqual({error, lease_expired},
+                 etcdgun_lease_keepalive_sup:start_child(?CLIENT, 4242424242, false)).
+
+%% The keepalive process stops with `{shutdown, lease_expired}' when its lease is gone (revoked
+%% by someone else, or expired), so a process which has to know monitors it.
+keepalive_lease_gone(_Config) ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{'ID' := LeaseId}} =
+        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 2}),
+    {ok, Pid} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, false),
+    MRef = erlang:monitor(process, Pid),
+    {ok, _} = etcdgun_etcdserverpb_lease_client:lease_revoke(Channel, #{'ID' => LeaseId}),
+    receive
+        {'DOWN', MRef, process, Pid, Reason} ->
+            ?assertEqual({shutdown, lease_expired}, Reason)
+    after 15000 ->
+        ct:fail(keepalive_still_running)
+    end.
+
+%% A crash of a subtree of the application does not take the others with it: the clients keep
+%% their connections and the lease keepalives keep running (they are not restarted, so they would
+%% be gone for good).
+one_subtree_crash(_Config) ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{'ID' := LeaseId}} =
+        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 30}),
+    {ok, Lease} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, true),
+    {ok, #{pid := Client}} = etcdgun_client:client_info(?CLIENT),
+    Sup = whereis(etcdgun_watcher_sup),
+    true = is_pid(Sup),
+    exit(Sup, kill),
+    ok = wait_until(fun() ->
+        case whereis(etcdgun_watcher_sup) of
+            Pid when is_pid(Pid), Pid =/= Sup -> true;
+            _ -> false
+        end
+    end, 20),
+    ?assert(is_process_alive(Client)),
+    ?assert(is_process_alive(Lease)),
+    ?assertMatch({ok, #{pid := Client}}, etcdgun_client:client_info(?CLIENT)),
+    ok = etcdgun_lease_keepalive_sup:stop_child(?CLIENT, LeaseId).
+
+%% No member is available when the watch is created: it does not block, and the watch is
+%% established when the members are back, also when the token of the members was lost by their
+%% restart.
+watch_without_connection(_Config) ->
+    Containers = [C || P <- [2379, 2479, 2579], {ok, C} <- [docker_member(P)]],
+    ?assertEqual(3, length(Containers)),
+    Prefix = key(),
+    [{0, _} = sh(["docker stop -t 1 ", C]) || C <- Containers],
+    try
+        ok = wait_until(fun() -> actives() =:= 0 end, 60),
+        {Time, Res} = timer:tc(fun() ->
+            etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)])
+        end),
+        ?assertMatch({ok, _}, Res),
+        %% The supervisor is not blocked by a watcher which can not connect.
+        ?assert(Time < 500000)
+    after
+        [{0, _} = sh(["docker start ", C]) || C <- Containers]
+    end,
+    ok = wait_until(fun() -> actives() =:= 3 end, 120),
+    %% The events of before the watch exists are not seen, so write until one is seen.
+    ok = wait_until(fun() ->
+        put_retry(<<Prefix/binary, "/x">>, <<"v">>),
+        receive
+            {watch_event, {watch_events, [_ | _]}} -> true
+        after 1000 -> false
+        end
+    end, 60),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
 %% The leader moves to another member, the watcher and the lease keepalive keep working.
 leader_change(_Config) ->
     Prefix = key(),
@@ -505,7 +662,16 @@ recv_events(Timeout) ->
         ct:fail(no_watch_events)
     end.
 
+%% The keys of the next `N' events, in order.
+recv_keys(N, _Timeout) when N =< 0 ->
+    [];
+recv_keys(N, Timeout) ->
+    Events = recv_events(Timeout),
+    Keys = [K || #{kv := #{key := K}} <- Events],
+    Keys ++ recv_keys(N - length(Keys), Timeout).
+
 %% A put through a channel which may be being replaced, e.g. right after a connection was killed.
+%% Returns the revision of the put.
 put_retry(Key, Value) ->
     put_retry(Key, Value, 20).
 
@@ -520,7 +686,7 @@ put_retry(Key, Value, N) ->
                 Error
         end,
     case Res of
-        {ok, _} -> ok;
+        {ok, #{header := #{revision := Revision}}} -> Revision;
         {error, _} -> timer:sleep(500), put_retry(Key, Value, N - 1)
     end.
 

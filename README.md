@@ -19,7 +19,8 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
 - [x] etcd authentication and auto-token-refreshing.
 - [x] lease keep alive [`etcdgun_lease_keepalive`](src/etcdgun_lease_keepalive.erl).
 - [x] watcher with auto-reconnect [`etcdgun_watcher`](src/etcdgun_watcher.erl).
-- [x] auth-check etcd member list [`etcdgun_membership`](src/etcdgun_membership.erl).
+- [x] check the member list of the cluster periodically, and sync the connections with it
+  ([`etcdgun_client`](src/etcdgun_client.erl), the `membership_check_interval` option).
 - [x] etcd endpoints health check when dial.
 - [ ] health check for active channels in interval.
 - [ ] idle connection keep alive?
@@ -34,19 +35,19 @@ Extract `ResponseHeader` from `rpc.proto` into `response_header.proto` to avoid
 ### Starting Client
 
 ```erlang
-Client = foo,
+Client = my_client,
 Opts = #{},
-{ok, _Pid} = etcdgun:open(my_client, [{"127.0.0.1", 2379}], Opts),
+{ok, _Pid} = etcdgun:open(Client, [{"127.0.0.1", 2379}], Opts),
 
-%% Now you can use `my_client' to pick channels and call the etcd gRPC APIs.
-{ok, Channel} = etcdgun_client:pick_channel(my_client).
+%% Now you can use `Client' to pick channels and call the etcd gRPC APIs.
+{ok, Channel} = etcdgun_client:pick_channel(Client).
 
 %% Get etcd member list via v3 API
 {ok, #{header := _, members := Members}} =
     etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}).
 
 %% Check heath via egrpc provided standard health check API
-{ok, #{status => 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}).
+{ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}).
 ```
 
 ### Client Options
@@ -60,6 +61,24 @@ Support egrpc interceptors, set with the `interceptors` option, e.g. the request
 The authentication token is not an interceptor: etcdgun sets egrpc `call_credentials` on every
 channel it opens, which adds the current token of the client to each call, streaming calls
 included. When the token is refreshed, the channels already picked use the new one too.
+
+### Lease Keepalive
+
+`etcdgun_lease_keepalive_sup:start_child(Client, LeaseId, RevokeWhenShutdown)` starts a process
+which keeps the lease alive, on its own connection to the cluster and reconnecting when it is
+lost. `RevokeWhenShutdown` revokes the lease when the process is stopped normally.
+
+The process is not restarted when the lease is gone (revoked by someone else or expired): it
+stops with the reason `{shutdown, lease_expired}`. `start_child/3` returns its pid, monitor it
+to know:
+
+```erlang
+{ok, Pid} = etcdgun_lease_keepalive_sup:start_child(my_client, LeaseId, true),
+MRef = erlang:monitor(process, Pid),
+receive
+    {'DOWN', MRef, process, Pid, {shutdown, lease_expired}} -> lease_is_gone
+end.
+```
 
 ### TLS
 
