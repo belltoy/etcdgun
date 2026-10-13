@@ -365,12 +365,17 @@ with_channel(Host, Port, Opts, Fun) ->
 
 do_get_member_list(Channel) ->
     maybe
-        {ok, #{members := Members0}} ?= etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
-        Members = [M || #{} = M <- Members0,
-                        (L = maps:get(isLearner, M, false)) =/= true,
-                        L =/= 1],
-        {ok, Members}
+        {ok, #{members := Members}} ?= etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+        {ok, usable_members(Members)}
     end.
+
+%% Learners do not serve normal requests, and members that were added but not started yet have no
+%% client URLs, so none of them can be connected to.
+usable_members(Members) ->
+    [M || #{clientURLs := [_|_]} = M <- Members, not is_learner(M)].
+
+is_learner(#{isLearner := IsLearner}) -> IsLearner =:= true orelse IsLearner =:= 1;
+is_learner(#{}) -> false.
 
 open_and_wait_members(_Client, [], _Opts, [], _Errors) -> {error, no_available_endpoints};
 open_and_wait_members(_Client, [], _Opts, Success, Errors) -> {ok, Success, Errors};
@@ -504,3 +509,17 @@ check_leader(Channel) ->
 
 hex(I) when is_integer(I) ->
     string:lowercase(binary:encode_hex(<<I:64>>)).
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+usable_members_test() ->
+    Started = #{'ID' => 1, clientURLs => [<<"http://127.0.0.1:2379">>], isLearner => false},
+    Learner = #{'ID' => 2, clientURLs => [<<"http://127.0.0.1:2479">>], isLearner => true},
+    Unstarted = #{'ID' => 3, clientURLs => [], isLearner => false},
+    NoLearnerKey = #{'ID' => 4, clientURLs => [<<"http://127.0.0.1:2579">>]},
+    ?assertEqual([Started, NoLearnerKey],
+                 usable_members([Started, Learner, Unstarted, NoLearnerKey])),
+    ?assertEqual([], usable_members([])),
+    ok.
+-endif.
