@@ -43,6 +43,7 @@
     retry_tref = undefined :: undefined | reference(),
     membership_tref = undefined :: undefined | reference(),
     membership_check_interval :: timeout(), %% 5 minutes
+    opts = #{} :: map(), %% Options (interceptors) used to open every channel
     token = undefined :: binary() | undefined,
     cred = undefined :: {binary(), binary()} | undefined
 }).
@@ -142,6 +143,7 @@ init({Client, Endpoints, Opts0}) ->
             members = maps:from_list([{Id, M} || #{'ID' := Id} = M <- Members]),
             actives = shuffle(Actives),
             membership_check_interval = MembershipCheckInterval,
+            opts = Opts,
             membership_tref = undefined,
             token = Token,
             cred = Cred
@@ -301,7 +303,7 @@ handle_continue(do_retry, #state{connectings = OldConnectings} = State) ->
             true ->
                 ?LOG_INFO("Retrying to connect to etcd members..."),
                 RetriesMembers = maps:values(maps:with(Retries, State#state.members)),
-                open_members(State#state.name, RetriesMembers, #{}, []);
+                open_members(State#state.name, RetriesMembers, State#state.opts, []);
             false ->
                 []
         end,
