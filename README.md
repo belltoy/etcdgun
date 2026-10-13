@@ -68,6 +68,10 @@ included. When the token is refreshed, the channels already picked use the new o
 which keeps the lease alive, on its own connection to the cluster and reconnecting when it is
 lost. `RevokeWhenShutdown` revokes the lease when the process is stopped normally.
 
+`start_child/3` returns `{error, Reason}` when the process can not start, e.g. `lease_expired`
+for a lease which does not exist. The process which failed exits with `Reason` (not `normal`),
+so the failure of a start is also in the logs as a crash report.
+
 The process is not restarted when the lease is gone (revoked by someone else or expired): it
 stops with the reason `{shutdown, lease_expired}`. `start_child/3` returns its pid, monitor it
 to know:
