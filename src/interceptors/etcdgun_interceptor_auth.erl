@@ -21,11 +21,26 @@ authenticate(Stream, Req, Opts, Next) ->
                [egrpc_stream:grpc_service(Stream), egrpc_stream:grpc_method(Stream)]),
     Service = atom_to_list(egrpc_stream:grpc_service(Stream)),
     Method = egrpc_stream:grpc_method(Stream),
+    %% Which RPCs require the token when authentication is enabled depends on the etcd version.
+    %% Without a token, the RPC fails with "etcdserver: user name is empty" where `token' is shown
+    %% (checked against etcd 3.5.10, 3.6.5 and 3.7.0):
+    %%
+    %%   RPC                              3.5     3.6     3.7
+    %%   KV.Range                         token   token   token
+    %%   Maintenance.Status               -       token   token
+    %%   Cluster.MemberList               -       -       token
+    %%   Lease.* (with LeaseKeepAlive)    -       -       token
+    %%
+    %% The token is always accepted, even by the RPCs which do not require it, so it is sent to all
+    %% of them except `Auth.Authenticate', which is how the token is obtained.
+    %%
+    %% TODO: `Cluster.MemberList' is still excluded, because it is called to discover the members
+    %% before the client has a token. etcd 3.7 requires a token for it, so the client can not be
+    %% started against etcd 3.7 with authentication enabled.
     ShouldAuth =
         case {string:split(Service, ".", all), Method} of
                 {["etcdserverpb", "Cluster"], 'MemberList'} -> false;
                 {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
-                {["etcdserverpb", "Lease"], _} -> false;
                 {["etcdserverpb", _], _} -> true;
                 {["v3electionpb", _], _} -> true;
                 {["v3lockpb", _], _} -> true;

@@ -27,6 +27,9 @@ init_req(Stream, Opts, Next, State) ->
     ShouldAuth =
         case {Service, Method} of
             {'etcdserverpb.Watch', 'Watch'} -> true;
+            %% etcd 3.7 requires the token for all the lease RPCs, older versions accept it. See
+            %% `etcdgun_interceptor_auth:authenticate/4'.
+            {'etcdserverpb.Lease', 'LeaseKeepAlive'} -> true;
             {'etcdserverpb.Maintenance', 'Snapshot'} -> true;
             {'v3electionpb.Election', 'Observe'} -> true;
             _ -> false
