@@ -63,6 +63,21 @@ included. When the token is refreshed, the channels already picked use the new o
 
 ### API Call
 
+The channel from `etcdgun_client:pick_channel/1` is used with the generated clients, e.g.
+`etcdgun_etcdserverpb_kv_client`. The token is added to every call for you.
+
+#### Known issue: `MemberPromote` with authentication on etcd 3.5 and 3.6
+
+When the authentication is enabled, etcd 3.5 and 3.6 reject
+`etcdgun_etcdserverpb_cluster_client:member_promote/2` if the channel is connected to a
+follower: the follower forwards the request to the leader with an internal request which has no
+token, the leader logs `failed to promote a member ... auth: user name is empty` and the caller
+only gets `{error, ...}` of `request timed out`. It is not a problem of the token of etcdgun,
+and the request works when it reaches the leader. etcd 3.7 does not have it. Send the
+`member_promote` through the channel of the leader, e.g. the member whose id is the `leader`
+of `etcdgun_etcdserverpb_maintenance_client:status/2`. The other member requests (`member_add`,
+`member_remove`, `member_list`) are not affected.
+
 
 ## Development
 
