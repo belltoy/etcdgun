@@ -3,6 +3,7 @@ words = [
     "connectings",
     "egrpc",
     "eqwalizer",
+    "etcd",
     "eunit",
     "gpb",
     "ifdef",
