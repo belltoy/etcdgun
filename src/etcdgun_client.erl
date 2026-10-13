@@ -28,6 +28,7 @@
     update_cred/3,
     unset_cred/1,
     pick_channel/1,
+    cached_token/1,
     refresh_token/1,
     sync_membership/2
 ]).
@@ -48,6 +49,7 @@
     cred = undefined :: {binary(), binary()} | undefined
 }).
 
+-define(TOKEN_TABLE, etcdgun_client_tokens).
 -define(RETRY_INTERVAL, 5000).
 -define(MEMBERSHIP_CHECK_INTERVAL, 300_000). % 5 minutes
 
@@ -86,6 +88,15 @@ refresh_token(Client) ->
         false ->
             % eqwalizer:ignore
             gen_server:call(Client, refresh_token)
+    end.
+
+%% @doc The current token of the client, read from the ETS table the client writes whenever its
+%% token changes, so the callers do not go through the client process.
+-spec cached_token(etcdgun:client()) -> {ok, binary()} | undefined.
+cached_token(Client) ->
+    case ets:lookup(?TOKEN_TABLE, Client) of
+        [{_, Token}] -> {ok, Token};
+        [] -> undefined
     end.
 
 -spec pick_channel(etcdgun:client() | pid()) ->
@@ -151,7 +162,7 @@ init({Client, Endpoints, Opts0}) ->
             token = Token,
             cred = Cred
         },
-        {ok, start_membership_timer(start_retry_timer(State))}
+        {ok, start_membership_timer(start_retry_timer(publish_token(State)))}
     else
         {error, Reason} ->
             ?LOG_ERROR("Failed to connect to etcd endpoints: ~p, reason: ~p",
@@ -177,10 +188,10 @@ handle_call(refresh_token, _From, #state{cred = undefined} = State) ->
 handle_call(refresh_token, _From, #state{cred = {Username, Password}} = State) ->
     case auth(State#state.actives, {Username, Password}) of
         {ok, Token} ->
-            {reply, {ok, Token}, State#state{token = Token}};
+            {reply, {ok, Token}, publish_token(State#state{token = Token})};
         {error, {etcd_error, auth_not_enabled}} ->
             ?LOG_WARNING("Authentication is not enabled on the etcd server, unsetting token"),
-            {reply, {error, auth_not_enabled}, State#state{token = undefined}};
+            {reply, {error, auth_not_enabled}, publish_token(State#state{token = undefined})};
         {error, Reason} ->
             ?LOG_ERROR("Failed to refresh token for client ~p: ~p", [State#state.name, Reason]),
             {reply, {error, Reason}, State}
@@ -190,25 +201,21 @@ handle_call(pick_channel, _From, #state{actives = []} = State) ->
     {reply, {error, no_available_connection}, State};
 
 handle_call(pick_channel, _From, #state{actives = [{_M, Channel, _MRef} = P | Rest]} = State) ->
-    Info1 = case {State#state.token, egrpc_stub:info(Channel, #{})} of
-                {undefined, Info} -> Info;
-                {Token, #{} = Info} -> Info#{token => Token}
-            end,
-    Channel1 = egrpc_stub:derive(Channel, #{info => Info1}),
-    {reply, {ok, Channel1}, State#state{actives = Rest ++ [P]}};
+    %% The token is not in the channel, the call credentials read the current one of the client.
+    {reply, {ok, Channel}, State#state{actives = Rest ++ [P]}};
 
 handle_call({update_cred, undefined}, _From, #state{cred = _Cred0} = State) ->
     ?LOG_INFO("Unset credentials for client ~p", [State#state.name]),
-    {reply, ok, State#state{cred = undefined, token = undefined}};
+    {reply, ok, publish_token(State#state{cred = undefined, token = undefined})};
 handle_call({update_cred, {Username, _Password} = Cred}, _From, #state{cred = _Cred0} = State) ->
     case auth(State#state.actives, Cred) of
         {ok, NewToken} ->
             ?LOG_INFO("Updated credentials for client ~p: ~p", [State#state.name, Username]),
-            {reply, ok, State#state{cred = Cred, token = NewToken}};
+            {reply, ok, publish_token(State#state{cred = Cred, token = NewToken})};
         {error, {etcd_error, auth_not_enabled}} ->
             ?LOG_WARNING("Authentication is not enabled on the etcd server, "
                          "updated credentials and unset token"),
-            {reply, ok, State#state{cred = Cred, token = undefined}};
+            {reply, ok, publish_token(State#state{cred = Cred, token = undefined})};
         {error, Reason} ->
             ?LOG_ERROR("Failed to update credentials for client ~p: ~p",
                       [State#state.name, Reason]),
@@ -252,7 +259,7 @@ handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
     {noreply, handle_gun_down(GunPid, Reason, State)};
 
 handle_info({token_renewed, Token}, State) ->
-    {noreply, State#state{token = Token}};
+    {noreply, publish_token(State#state{token = Token})};
 
 handle_info({check, Result, Elem}, State) ->
     {noreply, handle_check_result(Result, Elem, State)};
@@ -316,14 +323,22 @@ handle_continue(do_retry, #state{connectings = OldConnectings} = State) ->
     State1 = State#state{connectings = OldConnectings ++ Connectings},
     {noreply, start_retry_timer(State1)}.
 
-terminate(_Reason, #state{actives = Actives, connectings = Connectings} = _State) ->
+terminate(_Reason, #state{actives = Actives, connectings = Connectings} = State) ->
     ?LOG_NOTICE("Terminating etcdgun client, reason: ~p", [_Reason]),
     [ensure_close(Conn) || {_Id, _Channel, _MRef} = Conn <- Actives ++ Connectings],
+    ets:delete(?TOKEN_TABLE, State#state.name),
     ok.
 
 %%-------------------------------------------------------------------
 %% Private functions
 %%-------------------------------------------------------------------
+publish_token(#state{name = Name, token = undefined} = State) ->
+    ets:delete(?TOKEN_TABLE, Name),
+    State;
+publish_token(#state{name = Name, token = Token} = State) ->
+    ets:insert(?TOKEN_TABLE, {Name, Token}),
+    State.
+
 ensure_close({_Id, Channel, MRef}) ->
     erlang:demonitor(MRef, [flush]),
     egrpc_stub:close(Channel).
@@ -385,7 +400,8 @@ authenticate_bootstrap(Channel, Cred) ->
         Result -> Result
     end.
 
-%% Put the token into the channel info, the call credentials send it with the requests.
+%% Put the token into the channel info for a channel which is not the one of the client yet, the
+%% call credentials send it with the requests.
 with_token(Channel, undefined) -> Channel;
 with_token(Channel, Token) ->
     OldInfo = egrpc_stub:info(Channel, #{}),
@@ -611,6 +627,21 @@ usable_members_test() ->
                  usable_members([Started, Learner, Unstarted, NoLearnerKey])),
     ?assertEqual([], usable_members([])),
     ok.
+
+publish_token_test() ->
+    ets:new(?TOKEN_TABLE, [set, named_table, public]),
+    try
+        State = #state{name = foo, token = <<"t1">>},
+        ?assertEqual(undefined, cached_token(foo)),
+        ?assertEqual(State, publish_token(State)),
+        ?assertEqual({ok, <<"t1">>}, cached_token(foo)),
+        publish_token(State#state{token = <<"t2">>}),
+        ?assertEqual({ok, <<"t2">>}, cached_token(foo)),
+        publish_token(State#state{token = undefined}),
+        ?assertEqual(undefined, cached_token(foo))
+    after
+        ets:delete(?TOKEN_TABLE)
+    end.
 
 is_auth_required_test() ->
     UserEmpty = {grpc_error, invalid_argument, <<"etcdserver: user name is empty">>},

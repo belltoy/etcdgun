@@ -17,7 +17,7 @@
 
 %% @doc The call credentials of etcdgun channels, see `t:egrpc_stub:call_credentials/0'.
 %%
-%% It adds the token of the channel info to every call, streaming calls included.
+%% It adds the token to every call, streaming calls included.
 call_credentials(Stream) ->
     Service = egrpc_stream:grpc_service(Stream),
     Method = egrpc_stream:grpc_method(Stream),
@@ -33,7 +33,7 @@ call_credentials(Stream) ->
     %%
     %% The token is always accepted, even by the RPCs which do not require it, so it is sent to all
     %% of them except `Auth.Authenticate', which is how the token is obtained. When there is no
-    %% token in the channel info yet, e.g. the authentication is not enabled, nothing is sent.
+    %% token yet, e.g. the authentication is not enabled, nothing is sent.
     ShouldAuth =
         case {string:split(atom_to_list(Service), ".", all), Method} of
             {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
@@ -50,10 +50,13 @@ call_credentials(Stream) ->
             {ok, #{}}
     end.
 
+%% The token of the channel info is for the channels which are not opened by a client yet, e.g.
+%% while bootstrapping, otherwise the current one of the client.
 get_token(Stream) ->
     Channel = egrpc_stream:channel(Stream),
     case egrpc_stub:info(Channel) of
         #{token := Token} -> {ok, Token};
+        #{client := Client} -> etcdgun_client:cached_token(Client);
         _ -> undefined
     end.
 

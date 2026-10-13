@@ -26,6 +26,8 @@ stop_child(Client) ->
     end.
 
 init([]) ->
+    %% Owned by the supervisor, so it outlives the clients. See `etcdgun_client:cached_token/1'.
+    ets:new(etcdgun_client_tokens, [set, named_table, public, {read_concurrency, true}]),
     MaxRestarts = 300,
     MaxSecondsBetweenRestarts = 10,
     SupFlags = #{

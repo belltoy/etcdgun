@@ -53,7 +53,13 @@ Opts = #{},
 
 See [`etcdgun:opts()`](https://hexdocs.pm/etcdgun/etcdgun.html#t:opts/0) for the available options.
 
-Support egrpc interceptors, set with the `interceptors` option.
+Support egrpc interceptors, set with the `interceptors` option, e.g. the request logging
+`fun etcdgun_interceptor_log:log/4` and the token refreshing
+`fun etcdgun_interceptor_auth:refresh_token/4`.
+
+The authentication token is not an interceptor: etcdgun sets egrpc `call_credentials` on every
+channel it opens, which adds the current token of the client to each call, streaming calls
+included. When the token is refreshed, the channels already picked use the new one too.
 
 ### API Call
 
