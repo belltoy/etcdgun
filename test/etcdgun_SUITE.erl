@@ -16,7 +16,9 @@
     watch_events/1,
     watch_reconnect/1,
     lease_keepalive/1,
-    membership_sync/1
+    membership_sync/1,
+    member_down/1,
+    member_add_remove/1
 ]).
 
 -define(CLIENT, etcdgun_ct).
@@ -34,7 +36,9 @@ all() ->
         watch_events,
         watch_reconnect,
         lease_keepalive,
-        membership_sync
+        membership_sync,
+        member_down,
+        member_add_remove
     ].
 
 init_per_suite(Config) ->
@@ -53,10 +57,18 @@ end_per_suite(_Config) ->
 
 init_per_testcase(Case, Config) when Case =:= no_credentials; Case =:= wrong_password ->
     Config;
+init_per_testcase(Case, Config) when Case =:= member_down; Case =:= member_add_remove ->
+    case docker_member(2379) of
+        {ok, _} -> open_client(1000, Config);
+        {error, Reason} -> {skip, {no_docker, Reason}}
+    end;
 init_per_testcase(_Case, Config) ->
+    open_client(infinity, Config).
+
+open_client(Interval, Config) ->
     Opts = #{
         cred => ?CRED,
-        membership_check_interval => infinity,
+        membership_check_interval => Interval,
         interceptors => [fun etcdgun_interceptor_auth:refresh_token/4]
     },
     {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts),
@@ -192,9 +204,96 @@ membership_sync(_Config) ->
     {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
     {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}).
 
+%% A member goes down and comes back, the client drops its channel and connects again.
+member_down(_Config) ->
+    {ok, Container} = docker_member(2579),
+    {0, _} = sh(["docker stop -t 1 ", Container]),
+    try
+        ok = wait_until(fun() -> actives() =:= 2 end),
+        %% The requests are served by the other members.
+        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})
+    after
+        {0, _} = sh(["docker start ", Container])
+    end,
+    ok = wait_until(fun() -> actives() =:= 3 end, 60).
+
+%% A new member is added to the cluster and removed again. The membership is found by the periodic
+%% check, `sync_membership/2' is not called. The new member is a container which joins the network
+%% of the cluster, the members of the cluster are not changed.
+member_add_remove(_Config) ->
+    {ok, Etcd1} = docker_member(2379),
+    {0, Network} = sh(["docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}",
+                       "{{end}}' ", Etcd1]),
+    {0, Image} = sh(["docker inspect -f '{{.Config.Image}}' ", Etcd1]),
+    Ctl = ["docker exec ", Etcd1, " /usr/local/bin/etcdctl --user root:123456 "],
+    New = "etcdgun_ct_etcd4",
+    _ = sh(["docker rm -f ", New]),
+    try
+        %% Refused while a member is not in sync yet, e.g. right after one was restarted.
+        ok = wait_until(fun() ->
+            {Code, _} = sh([Ctl, "member add etcd-4 --peer-urls=http://etcd-4:2380"]),
+            Code =:= 0
+        end, 60),
+        {0, _} = sh(["docker run -d --name ", New, " --network ", Network,
+                     " --network-alias etcd-4 -p 2679:2379 --entrypoint /usr/local/bin/etcd ",
+                     Image, " --name=etcd-4 --data-dir=/etcd_data",
+                     " --listen-peer-urls=http://0.0.0.0:2380",
+                     " --listen-client-urls=http://0.0.0.0:2379",
+                     " --initial-advertise-peer-urls=http://etcd-4:2380",
+                     " --advertise-client-urls=http://127.0.0.1:2679",
+                     " --initial-cluster-token=etcd-cluster",
+                     " --initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,",
+                     "etcd-3=http://etcd-3:2380,etcd-4=http://etcd-4:2380",
+                     " --initial-cluster-state=existing"]),
+        ok = wait_until(fun() -> members() =:= 4 andalso actives() =:= 4 end, 90),
+        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+        remove_member(Ctl, "etcd-4"),
+        ok = wait_until(fun() -> members() =:= 3 andalso actives() =:= 3 end, 90)
+    after
+        %% Leave the cluster as it was, also when the test failed.
+        remove_member(Ctl, "etcd-4"),
+        _ = sh(["docker rm -f ", New])
+    end.
+
 %%-------------------------------------------------------------------
 %% Helpers
 %%-------------------------------------------------------------------
+
+members() ->
+    {ok, #{members := Members}} = etcdgun_client:client_info(?CLIENT),
+    length(Members).
+
+actives() ->
+    {ok, #{actives := Actives}} = etcdgun_client:client_info(?CLIENT),
+    Actives.
+
+%% Run a shell command, return its exit code and the output without the trailing newline.
+sh(Cmd) ->
+    Out = os:cmd(lists:flatten(Cmd) ++ " 2>&1; echo \"\n$?\""),
+    Lines = string:split(string:trim(Out), "\n", all),
+    Code = list_to_integer(string:trim(lists:last(Lines))),
+    {Code, string:trim(lists:join("\n", lists:droplast(Lines)))}.
+
+%% The container of the compose cluster which publishes the port, the members are told apart by it.
+docker_member(Port) ->
+    case sh(["docker ps --filter publish=", integer_to_list(Port), " --format '{{.Names}}'"]) of
+        {0, [_ | _] = Name} -> {ok, hd(string:split(Name, "\n"))};
+        {0, _} -> {error, no_container};
+        {_, Output} -> {error, Output}
+    end.
+
+%% Remove the member by name, nothing happens if there is no one.
+remove_member(Ctl, Name) ->
+    {_, Out} = sh([Ctl, "member list"]),
+    case [L || L <- string:split(Out, "\n", all), string:find(L, Name) =/= nomatch] of
+        [Line | _] ->
+            [Id | _] = string:split(Line, ","),
+            sh([Ctl, "member remove ", string:trim(Id)]);
+        [] ->
+            ok
+    end.
 
 %% The {Major, Minor} of the server, asked through a client with the credentials.
 etcd_version() ->

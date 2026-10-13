@@ -26,7 +26,12 @@ etcd-up version="v3.5.10":
     export ETCD_VERSION={{version}}
     export ETCD_DATA_DIR=data/ct/$ETCD_VERSION
     mkdir -m 700 -p $ETCD_DATA_DIR/etcd-{1,2,3}
-    docker compose up -d
+    # Docker Desktop may not see a directory which was just created yet, retry.
+    for i in $(seq 5); do
+        docker compose up -d && break
+        [ $i -lt 5 ] || exit 1
+        sleep 2
+    done
     ctl="docker compose exec -T etcd-1 /usr/local/bin/etcdctl"
     for _ in $(seq 60); do
         $ctl endpoint health >/dev/null 2>&1 && break
