@@ -1,6 +1,6 @@
-%% Integration tests against the etcd cluster of `just etcd' (docker-compose, v3.5.10), which has
-%% authentication enabled with the user `root' and the password `123456'. The suite is skipped when
-%% the cluster is not reachable.
+%% Integration tests against an etcd cluster of the docker-compose, 3.5, 3.6 or 3.7, which has
+%% authentication enabled with the user `root' and the password `123456', see `just etcd-up' and
+%% `just ct-all'. The suite is skipped when the cluster is not reachable.
 -module(etcdgun_SUITE).
 
 -include_lib("stdlib/include/assert.hrl").
@@ -70,13 +70,22 @@ end_per_testcase(_Case, _Config) ->
 %% Test cases
 %%-------------------------------------------------------------------
 
-%% etcd 3.5 does not require the token for the member list and the status, which is all the
-%% client needs to open, but the KV requests are rejected. Newer versions refuse to open.
+%% The members and the status are what the client needs to open. Which of the RPCs require the
+%% token depends on the version, see `etcdgun_interceptor_auth': etcd 3.5 does not require it for
+%% any of them, so the client opens and only the KV requests are rejected. Newer versions refuse
+%% to open without the credentials.
 no_credentials(_Config) ->
-    {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, #{membership_check_interval => infinity}),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    ?assertMatch({error, _}, etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})),
-    ok = etcdgun:close(?CLIENT).
+    Opts = #{membership_check_interval => infinity},
+    case etcd_version() of
+        {3, 5} ->
+            {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts),
+            {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+            ?assertMatch({error, _},
+                         etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})),
+            ok = etcdgun:close(?CLIENT);
+        _ ->
+            ?assertMatch({error, _}, open_without_cred(Opts))
+    end.
 
 wrong_password(_Config) ->
     Res = open_without_cred(#{cred => {"root", "wrong-password"}}),
@@ -186,6 +195,15 @@ membership_sync(_Config) ->
 %%-------------------------------------------------------------------
 %% Helpers
 %%-------------------------------------------------------------------
+
+%% The {Major, Minor} of the server, asked through a client with the credentials.
+etcd_version() ->
+    {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, #{cred => ?CRED, membership_check_interval => infinity}),
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{version := Version}} = etcdgun_etcdserverpb_maintenance_client:status(Channel, #{}),
+    ok = etcdgun:close(?CLIENT),
+    [Major, Minor | _] = string:split(binary_to_list(Version), ".", all),
+    {list_to_integer(Major), list_to_integer(Minor)}.
 
 open_without_cred(Opts) ->
     Res = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts#{membership_check_interval => infinity}),

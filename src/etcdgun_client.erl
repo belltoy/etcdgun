@@ -355,7 +355,8 @@ start_membership_timer(#state{membership_check_interval = infinity} = State) ->
     State;
 start_membership_timer(#state{membership_check_interval = 0} = State) ->
     State;
-start_membership_timer(#state{membership_check_interval = Interval} = State) when Interval > 0 ->
+start_membership_timer(#state{membership_check_interval = Interval} = State)
+  when is_integer(Interval), Interval > 0 ->
     TRef = erlang:start_timer(Interval, self(), check_membership),
     State#state{membership_tref = TRef}.
 

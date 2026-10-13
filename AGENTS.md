@@ -17,12 +17,13 @@ Erlang gRPC client for etcd v3 (229 source files). Auto-generates gRPC service s
 |---------|---------|
 | `rebar3 compile` | Build with code generation (proto → egrpc → compile) |
 | `rebar3 eunit` | Run embedded tests (in src/etcdgun.erl and src/etcdgun_client.erl) |
-| `rebar3 ct` | Integration tests in `test/etcdgun_SUITE.erl`, need the etcd cluster of `just etcd`; skipped if it is not reachable |
+| `rebar3 ct` | Integration tests in `test/etcdgun_SUITE.erl`, need a running etcd cluster with auth (`just etcd-up [version]`); skipped if it is not reachable |
+| `just ct-all` | Run the CT suite on etcd v3.5.10, v3.6.5 and v3.7.0, each from a clean cluster (data in `data/ct/`) which is destroyed afterwards; the images must be pulled |
 | `rebar3 fmt -w` | Format code with erlfmt |
 | `rebar3 dialyzer` | Static type analysis (Erlang 26.2 compatible) |
 | `rebar3 ex_doc` | Generate hexdocs documentation |
 
-Run in sequence for full verification. The CT suite assumes the dev cluster has authentication enabled with `root`/`123456`.
+Run in sequence for full verification. The CT suite assumes the cluster has authentication enabled with `root`/`123456`, which `just etcd-up` sets up.
 
 ## Dev Environment
 
@@ -73,6 +74,8 @@ just clean         # Cleans persistent data (data/etcd-{1,2,3})
 - Dev config hardcodes auth for testing; change via `etcdgun_client:update_cred/3` at runtime
 - A few inline eunit tests and one CT suite (`rebar3 ct`); no CI workflows
 - `just etcd-down` removes the cluster containers, the data in `data/` is kept
+- The test clusters (`etcd-up`, `ct-all`) are a separate compose project with their own data in `data/ct/`, never `data/etcd-*` of `just etcd`; destroy them with `just etcd-ct-destroy`
+- The suite must pass on etcd 3.5, 3.6 and 3.7, always from a clean cluster as the regression
 
 **Tool Versions** (from .mise.toml):
 - Erlang 26.2, Rebar 3.24.0, ELP otp-26

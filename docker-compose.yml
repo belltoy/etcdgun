@@ -1,6 +1,6 @@
 services:
     etcd-1:
-        image: "quay.io/coreos/etcd:v3.5.10"
+        image: "quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.10}"
         entrypoint: /usr/local/bin/etcd
         environment:
           - ETCD_LOG_LEVEL=debug
@@ -21,9 +21,9 @@ services:
             - 2379:2379
             - 12379:2379
         volumes:
-            - ./data/etcd-1:/etcd_data
+            - ./${ETCD_DATA_DIR:-data}/etcd-1:/etcd_data
     etcd-2:
-        image: "quay.io/coreos/etcd:v3.5.10"
+        image: "quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.10}"
         entrypoint: /usr/local/bin/etcd
         environment:
           - ETCD_LOG_LEVEL=debug
@@ -44,9 +44,9 @@ services:
             - 2479:2379
             - 22379:2379
         volumes:
-            - ./data/etcd-2:/etcd_data
+            - ./${ETCD_DATA_DIR:-data}/etcd-2:/etcd_data
     etcd-3:
-        image: "quay.io/coreos/etcd:v3.5.10"
+        image: "quay.io/coreos/etcd:${ETCD_VERSION:-v3.5.10}"
         entrypoint: /usr/local/bin/etcd
         environment:
           - ETCD_LOG_LEVEL=debug
@@ -67,4 +67,4 @@ services:
             - 2579:2379
             - 32379:2379
         volumes:
-            - ./data/etcd-3:/etcd_data
+            - ./${ETCD_DATA_DIR:-data}/etcd-3:/etcd_data
