@@ -194,12 +194,12 @@ recv_response_header(Stream, Timeout) ->
 process_response(#{created := true,
                    canceled := false,
                    watch_id := WatchId, header := #{revision := Rev}} = Response,
-                 #state{creatings = Creatings, watches = Watches} = State) ->
+                 #state{creatings = CreatingWatches, watches = Watches} = State) ->
     maybe
         true ?= lists:member(WatchId, State#state.creatings),
         ?LOG_INFO("Watcher ~p created watch with ID ~p, revision ~p",
                   [State#state.watcher_name, WatchId, Rev]),
-        Rest = Creatings -- [WatchId],
+        Rest = CreatingWatches -- [WatchId],
         length(Rest) =:= 0 andalso ?LOG_INFO("All watches created for watcher ~p",
                                              [State#state.watcher_name]),
         {noreply, State#state{creatings = Rest, watches = Watches#{WatchId => Rev}}}
