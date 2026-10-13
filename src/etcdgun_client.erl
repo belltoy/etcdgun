@@ -509,8 +509,8 @@ check_leader(Channel) ->
     case etcdgun_etcdserverpb_maintenance_client:status(Channel, #{}) of
         {ok, #{leader := 0}} -> {error, no_leader};
         {ok, #{leader := LeaderId, errors := Errors}} when LeaderId > 0 ->
-            case length(Errors) of
-                0 -> ok;
+            case Errors of
+                [] -> ok;
                 _ ->
                     ?LOG_WARNING("Errors reported by etcd server: ~s", [lists:join("; ", Errors)])
             end,
@@ -519,7 +519,7 @@ check_leader(Channel) ->
     end.
 
 hex(I) when is_integer(I) ->
-    string:lowercase(binary:encode_hex(<<I:64>>)).
+    binary:encode_hex(<<I:64>>, lowercase).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
