@@ -44,6 +44,10 @@ open(Client, Endpoints) ->
 %%
 %% Returns `{error, no_credentials}' if the etcd server requires authentication but no `cred' is
 %% given.
+%%
+%% The options `unary_interceptors' and `stream_interceptors' of the former versions are replaced
+%% by `interceptors', they return `{error, {removed_option, Key}}'. The authentication is not an
+%% interceptor to be configured anymore.
 -spec open(client(), [endpoint()], opts()) -> {ok, pid()} | {error, Reason :: term()}.
 open(Client, Endpoints, Opts) ->
     etcdgun_client_sup:start_child(Client, Endpoints, Opts).

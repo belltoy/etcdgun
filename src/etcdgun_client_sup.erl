@@ -6,16 +6,25 @@
 
 -export([start_child/3, stop_child/1]).
 
+%% The options of the former versions which were replaced by `interceptors'.
+-define(REMOVED_OPTS, [unary_interceptors, stream_interceptors]).
+
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 -spec start_child(etcdgun:client(), [etcdgun:endpoint()], etcdgun:opts()) ->
     {ok, pid()} | {error, term()}.
 start_child(Client, Endpoints, Opts) ->
-    Child = child_spec(Client, Endpoints, Opts),
-    case supervisor:start_child(?MODULE, Child) of
-        {ok, Pid} when is_pid(Pid) -> {ok, Pid};
-        {error, Reason} -> {error, Reason}
+    %% Silently dropping them would leave the interceptors of the former versions not working.
+    case [K || K <- ?REMOVED_OPTS, is_map_key(K, Opts)] of
+        [] ->
+            Child = child_spec(Client, Endpoints, Opts),
+            case supervisor:start_child(?MODULE, Child) of
+                {ok, Pid} when is_pid(Pid) -> {ok, Pid};
+                {error, Reason} -> {error, Reason}
+            end;
+        [Key | _] ->
+            {error, {removed_option, Key}}
     end.
 
 -spec stop_child(etcdgun:client()) -> ok | {error, not_found}.
@@ -46,3 +55,15 @@ child_spec(Client, Endpoints, Opts) ->
         type => worker,
         modules => [etcdgun_client]
     }.
+
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
+
+removed_option_test() ->
+    % eqwalizer:ignore
+    ?assertEqual({error, {removed_option, unary_interceptors}},
+                 start_child(c, [], #{unary_interceptors => []})),
+    % eqwalizer:ignore
+    ?assertEqual({error, {removed_option, stream_interceptors}},
+                 start_child(c, [], #{cred => {"u", "p"}, stream_interceptors => []})).
+-endif.

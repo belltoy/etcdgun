@@ -487,7 +487,6 @@ open_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success) ->
         open_members(Client, Rest, Opts, [{Id, Channel, MRef} | Success])
     end.
 
-auth(_Channels, undefined) -> {ok, undefined};
 auth([], _Cred) -> {error, no_available_connection};
 auth([{_MemberId, Channel, _MRef} | _], Cred) ->
     authenticate(Channel, Cred).
