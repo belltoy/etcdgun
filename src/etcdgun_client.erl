@@ -447,6 +447,9 @@ handle_check_result(Result, {MemberId, Channel, MRef} = Elem,
             ?LOG_WARNING("Failed to check endpoint for member (~s) ~s:~p, reason: ~p",
                          [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel),
                           Reason]),
+            %% It is not in any list anymore, so close it, or the connection is leaked and
+            %% a new one is opened on the next retry.
+            ensure_close(Elem),
             State2;
         false ->
             ?LOG_WARNING("Received check result for unknown connection: ~p", [Elem]),
@@ -464,16 +467,24 @@ handle_gun_up(GunPid, #state{connectings = Connectings} = State) ->
             State
     end.
 
-handle_gun_down(GunPid, Reason, #state{actives = Actives} = State) ->
-    case lists:search(fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end, Actives) of
-        {value, {_MemberId, Channel, MRef} = Elem} ->
+handle_gun_down(GunPid, Reason, #state{actives = Actives, connectings = Connectings} = State) ->
+    IsGun = fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end,
+    %% A connecting one may be down too, e.g. the member is down and gun gives up connecting.
+    %% Drop it, or it stays in `connectings' and the member is never retried.
+    case {lists:search(IsGun, Actives), lists:search(IsGun, Connectings)} of
+        {{value, {_MemberId, Channel, _MRef} = Elem}, _} ->
             ?LOG_WARNING("Connection down for member ~s:~p, reason: ~p",
                          [egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
-            erlang:demonitor(MRef, [flush]),
-            egrpc_stub:close(Channel),
+            ensure_close(Elem),
             %% eqwalizer:ignore
             State#state{actives = lists:delete(Elem, Actives)};
-        false ->
+        {false, {value, {_MemberId, Channel, _MRef} = Elem}} ->
+            ?LOG_WARNING("Failed to connect to member ~s:~p, reason: ~p, will retry",
+                         [egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
+            ensure_close(Elem),
+            %% eqwalizer:ignore
+            State#state{connectings = lists:delete(Elem, Connectings)};
+        {false, false} ->
             State
     end.
 
