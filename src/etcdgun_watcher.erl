@@ -79,7 +79,7 @@ init({Client, WatcherName, EventMgr, WatchRequests}) ->
 
         WatchRequests1 = assign_watch_id(WatchRequests),
         %% Try to load last revision if the watcher is being restarted.
-        WatchRequests2 = load_lasst_revision(WatcherName, WatchRequests1),
+        WatchRequests2 = load_last_revision(WatcherName, WatchRequests1),
         %% Send the create request.
         % Stream1 = egrpc_stream:send_msg(Stream, WatchRequests1, nofin),
         Stream1 = send_watch_requests(Stream, WatchRequests2),
@@ -236,7 +236,7 @@ assign_watch_id(WatchRequests) ->
 
 % If the watcher was previously registered, we can start from the last revision.
 % This is useful for resuming watches after a disconnect.
-load_lasst_revision(WatcherName, WatchRequests) ->
+load_last_revision(WatcherName, WatchRequests) ->
     LastRevisions = case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
                         [] -> #{};
                         [#watcher_cache{last_revisions = LastRevisions0}] -> LastRevisions0
