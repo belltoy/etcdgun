@@ -24,7 +24,12 @@
 -type endpoint() :: {Host :: string(), Port :: inet:port_number()}.
 -type opts() :: #{
       cred => {Username :: string(), Password :: string()},
+      %% Not used yet, the scheme of the client URLs is ignored.
       transport => tcp | tls,
+      %% How often to check the members of the cluster, in milliseconds, 5 minutes by default.
+      %% `0' and `infinity' disable the check.
+      membership_check_interval => non_neg_integer() | infinity,
+      %% The egrpc interceptors of every channel, the authentication is not one of them.
       interceptors => [egrpc_interceptor:spec()]
 }.
 

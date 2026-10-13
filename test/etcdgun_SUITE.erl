@@ -18,7 +18,9 @@
     lease_keepalive/1,
     membership_sync/1,
     member_down/1,
-    member_add_remove/1
+    member_add_remove/1,
+    learner_member/1,
+    leader_change/1
 ]).
 
 -define(CLIENT, etcdgun_ct).
@@ -38,7 +40,9 @@ all() ->
         lease_keepalive,
         membership_sync,
         member_down,
-        member_add_remove
+        member_add_remove,
+        learner_member,
+        leader_change
     ].
 
 init_per_suite(Config) ->
@@ -57,7 +61,8 @@ end_per_suite(_Config) ->
 
 init_per_testcase(Case, Config) when Case =:= no_credentials; Case =:= wrong_password ->
     Config;
-init_per_testcase(Case, Config) when Case =:= member_down; Case =:= member_add_remove ->
+init_per_testcase(Case, Config)
+  when Case =:= member_down; Case =:= member_add_remove; Case =:= learner_member ->
     case docker_member(2379) of
         {ok, _} -> open_client(1000, Config);
         {error, Reason} -> {skip, {no_docker, Reason}}
@@ -222,6 +227,69 @@ member_down(_Config) ->
 %% check, `sync_membership/2' is not called. The new member is a container which joins the network
 %% of the cluster, the members of the cluster are not changed.
 member_add_remove(_Config) ->
+    with_new_member(false, fun(Ctl) ->
+        ok = wait_until(fun() -> members() =:= 4 andalso actives() =:= 4 end, 90),
+        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+        remove_member(Ctl, "etcd-4"),
+        ok = wait_until(fun() -> members() =:= 3 andalso actives() =:= 3 end, 90)
+    end).
+
+%% A learner does not serve the requests, the client does not connect to it until it is promoted.
+learner_member(_Config) ->
+    with_new_member(true, fun(Ctl) ->
+        %% Long enough for several periodic checks, the learner is not a member to connect to.
+        timer:sleep(4000),
+        ?assertEqual({3, 3}, {members(), actives()}),
+        %% With the authentication, etcd 3.5 and 3.6 fail a promote which a follower forwards to
+        %% the leader: the internal peer request has no token, the leader logs `failed to promote
+        %% a member ... auth: user name is empty' and the caller sees `request timed out'. 3.7
+        %% does not, a follower works there. So it is sent to the leader.
+        ok = wait_until({promote, Ctl}, fun() ->
+            {Code, Out} = sh([leader_ctl(), "member promote ", member_id(Ctl, "etcd-4")]),
+            put(last_output, Out),
+            Code =:= 0
+        end, 60),
+        ok = wait_until({four, Ctl}, fun() -> members() =:= 4 andalso actives() =:= 4 end, 90),
+        remove_member(Ctl, "etcd-4"),
+        ok = wait_until({three, Ctl}, fun() -> members() =:= 3 andalso actives() =:= 3 end, 90)
+    end).
+
+%% The leader moves to another member, the watcher and the lease keepalive keep working.
+leader_change(_Config) ->
+    Prefix = key(),
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{'ID' := LeaseId}} =
+        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 3}),
+    {ok, _} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, false),
+    try
+        A = <<Prefix/binary, "/a">>,
+        put_retry(A, <<"1">>),
+        ?assertMatch([#{kv := #{key := A}}], recv_events()),
+        Leader0 = move_leader(),
+        ok = wait_until(fun() -> leader() =/= Leader0 end, 30),
+        B = <<Prefix/binary, "/b">>,
+        put_retry(B, <<"2">>),
+        ?assertMatch([#{kv := #{key := B}}], recv_events(15000)),
+        %% Longer than the TTL, the keepalive is working on the new leader.
+        timer:sleep(5000),
+        {ok, Ch} = etcdgun_client:pick_channel(?CLIENT),
+        {ok, #{'TTL' := TTL}} =
+            etcdgun_etcdserverpb_lease_client:lease_time_to_live(Ch, #{'ID' => LeaseId}),
+        ?assert(TTL > 0)
+    after
+        _ = etcdgun_lease_keepalive_sup:stop_child(?CLIENT, LeaseId),
+        _ = etcdgun:cancel_watch(?CLIENT, ct_watcher)
+    end.
+
+%%-------------------------------------------------------------------
+%% Helpers
+%%-------------------------------------------------------------------
+
+%% Add a fourth member, a container which joins the cluster, call the function, and leave the
+%% cluster as it was, also when the function fails.
+with_new_member(Learner, Fun) ->
     {ok, Etcd1} = docker_member(2379),
     {0, Network} = sh(["docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}",
                        "{{end}}' ", Etcd1]),
@@ -232,7 +300,8 @@ member_add_remove(_Config) ->
     try
         %% Refused while a member is not in sync yet, e.g. right after one was restarted.
         ok = wait_until(fun() ->
-            {Code, _} = sh([Ctl, "member add etcd-4 --peer-urls=http://etcd-4:2380"]),
+            {Code, _} = sh([Ctl, "member add etcd-4 --peer-urls=http://etcd-4:2380",
+                            [" --learner" || Learner]]),
             Code =:= 0
         end, 60),
         {0, _} = sh(["docker run -d --name ", New, " --network ", Network,
@@ -246,20 +315,53 @@ member_add_remove(_Config) ->
                      " --initial-cluster=etcd-1=http://etcd-1:2380,etcd-2=http://etcd-2:2380,",
                      "etcd-3=http://etcd-3:2380,etcd-4=http://etcd-4:2380",
                      " --initial-cluster-state=existing"]),
-        ok = wait_until(fun() -> members() =:= 4 andalso actives() =:= 4 end, 90),
-        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
-        remove_member(Ctl, "etcd-4"),
-        ok = wait_until(fun() -> members() =:= 3 andalso actives() =:= 3 end, 90)
+        Fun(Ctl)
     after
-        %% Leave the cluster as it was, also when the test failed.
         remove_member(Ctl, "etcd-4"),
         _ = sh(["docker rm -f ", New])
     end.
 
-%%-------------------------------------------------------------------
-%% Helpers
-%%-------------------------------------------------------------------
+member_id(Ctl, Name) ->
+    {_, Out} = sh([Ctl, "member list"]),
+    [Line | _] = [L || L <- string:split(Out, "\n", all), string:find(L, Name) =/= nomatch],
+    [Id | _] = string:split(Line, ","),
+    string:trim(Id).
+
+%% `etcdctl' in the container of the leader, the client URL of the member is published on the host,
+%% so the container is the one which publishes the port.
+leader_ctl() ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+    LeaderId = leader(),
+    [#{clientURLs := [Url | _]}] = [M || #{'ID' := Id} = M <- Members, Id =:= LeaderId],
+    #{port := Port} = uri_string:parse(Url),
+    {ok, Container} = docker_member(Port),
+    ["docker exec ", Container, " /usr/local/bin/etcdctl --user root:123456 "].
+
+%% The member id of the leader, by the status of any member.
+leader() ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{leader := Leader}} = etcdgun_etcdserverpb_maintenance_client:status(Channel, #{}),
+    Leader.
+
+%% Ask the leader to move the leadership to another member, return the old leader. The request is
+%% only accepted by the leader, so the channels are picked until one of them is its.
+move_leader() ->
+    Leader = leader(),
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+    [Target | _] = [Id || #{'ID' := Id} <- Members, Id =/= Leader],
+    ok = move_leader(Leader, Target, 20),
+    Leader.
+
+move_leader(_Leader, _Target, 0) ->
+    ct:fail(move_leader_failed);
+move_leader(Leader, Target, N) ->
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    case etcdgun_etcdserverpb_maintenance_client:move_leader(Channel, #{targetID => Target}) of
+        {ok, _} -> ok;
+        {error, _} -> move_leader(Leader, Target, N - 1)
+    end.
 
 members() ->
     {ok, #{members := Members}} = etcdgun_client:client_info(?CLIENT),
@@ -350,9 +452,26 @@ put_retry(Key, Value, N) ->
 
 wait_until(Fun) -> wait_until(Fun, 40).
 
-wait_until(_Fun, 0) -> ct:fail(timeout);
-wait_until(Fun, N) ->
+wait_until(Fun, N) -> wait_until(undefined, Fun, N).
+
+%% `Label' tells which wait timed out, with the state of the client and of the cluster.
+wait_until(Label, _Fun, 0) ->
+    {ok, Info} = etcdgun_client:client_info(?CLIENT),
+    Cluster = case Label of
+        {_, Ctl} ->
+            #{members => sh([Ctl, "member list"]),
+              learner_log => sh(["docker logs --tail 15 etcdgun_ct_etcd4"])};
+        _ ->
+            undefined
+    end,
+    ct:pal("timeout ~p~nclient: ~p~ncluster: ~p~nlast output: ~p",
+           [label_name(Label), maps:remove(token, Info), Cluster, get(last_output)]),
+    ct:fail({timeout, label_name(Label)});
+wait_until(Label, Fun, N) ->
     case Fun() of
         true -> ok;
-        false -> timer:sleep(500), wait_until(Fun, N - 1)
+        false -> timer:sleep(500), wait_until(Label, Fun, N - 1)
     end.
+
+label_name(Label) when is_tuple(Label) -> element(1, Label);
+label_name(Label) -> Label.
