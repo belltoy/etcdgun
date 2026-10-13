@@ -15,7 +15,7 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
     - `v3electionpb.Election`
     - `v3lockpb.Lock`
 - [x] gRPC health v1 API (via [`egrpc`](https://github.com/belltoy/grpc))
-- [x] unary and streaming [interceptors](src/interceptors/) for more flexible needs.
+- [x] [interceptors](src/interceptors/) for more flexible needs, the token is sent by egrpc `call_credentials`.
 - [x] etcd authentication and auto-token-refreshing.
 - [x] lease keep alive [`etcdgun_lease_keepalive`](src/etcdgun_lease_keepalive.erl).
 - [x] watcher with auto-reconnect [`etcdgun_watcher`](src/etcdgun_watcher.erl).
@@ -53,7 +53,7 @@ Opts = #{},
 
 See [`etcdgun:opts()`](https://hexdocs.pm/etcdgun/etcdgun.html#t:opts/0) for the available options.
 
-Support unary interceptors and streaming interceptors.
+Support egrpc interceptors, set with the `interceptors` option.
 
 ### API Call
 

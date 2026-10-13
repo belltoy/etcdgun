@@ -63,8 +63,12 @@ handle_info({timeout, TRef, retry}, #state{client = Client, retry_ref = TRef} = 
     end;
 handle_info({timeout, TRef, keepalive}, #state{lease_id = LeaseId, timer_ref = TRef} = State) ->
     Request = #{'ID' => LeaseId},
-    Stream1 = egrpc_stream:send_msg(State#state.stream, Request, nofin),
-    {noreply, State#state{timer_ref = undefined, stream = Stream1}};
+    case egrpc_stream:send_msg(State#state.stream, Request, nofin) of
+        {ok, Stream1} ->
+            {noreply, State#state{timer_ref = undefined, stream = Stream1}};
+        {error, Reason} ->
+            {noreply, State#state{timer_ref = undefined}, {continue, {retry, Reason}}}
+    end;
 
 %% Receive messages from the Gun connection
 handle_info({gun_data, _ConnPid, StreamRef, nofin, Data},
@@ -129,8 +133,10 @@ terminate(Reason, #state{stream = Stream} = State) ->
             ?LOG_ERROR("Terminating lease keepalive with reason: ~p", [Reason]),
             ok
     end,
-    Stream1 = egrpc_stream:close_send(Stream),
-    egrpc_stream:cancel_stream(Stream1),
+    %% The stream is cancelled anyway, so whether the close of the send side succeeded is not
+    %% important.
+    _ = egrpc_stream:close_send(Stream),
+    egrpc_stream:cancel_stream(Stream),
     ok.
 
 %%-------------------------------------------------------------------
@@ -187,7 +193,7 @@ new_request(Client, LeaseId, RevokeWhenShutdown) ->
     maybe
         {ok, Channel} ?= pick_channel(Client),
         {ok, Stream} ?= etcdgun_etcdserverpb_lease_client:lease_keep_alive(Channel),
-        Stream1 = egrpc_stream:send_msg(Stream, #{'ID' => LeaseId}, nofin),
+        {ok, Stream1} ?= egrpc_stream:send_msg(Stream, #{'ID' => LeaseId}, nofin),
         recv_create_response(Client, LeaseId, Stream1, Channel, RevokeWhenShutdown)
     end.
 

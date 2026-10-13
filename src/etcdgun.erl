@@ -25,8 +25,7 @@
 -type opts() :: #{
       cred => {Username :: string(), Password :: string()},
       transport => tcp | tls,
-      stream_interceptors => [egrpc_stub:stream_interceptor()],
-      unary_interceptors => [egrpc_stub:unary_interceptor()]
+      interceptors => [egrpc_interceptor:spec()]
 }.
 
 clients() ->

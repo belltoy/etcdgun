@@ -81,8 +81,7 @@ init({Client, WatcherName, EventMgr, WatchRequests}) ->
         %% Try to load last revision if the watcher is being restarted.
         WatchRequests2 = load_last_revision(WatcherName, WatchRequests1),
         %% Send the create request.
-        % Stream1 = egrpc_stream:send_msg(Stream, WatchRequests1, nofin),
-        Stream1 = send_watch_requests(Stream, WatchRequests2),
+        {ok, Stream1} ?= send_watch_requests(Stream, WatchRequests2),
 
         %% Receive the response header
         {ok, Stream2} ?= recv_response_header(Stream1, 5000),
@@ -151,6 +150,7 @@ handle_info(Info, State) ->
 handle_continue(process_data, #state{buf = Buf, stream = Stream} = State) ->
     case egrpc_stream:parse_msg(Stream, Buf) of
         more -> {noreply, State};
+        {error, Reason} -> {stop, {grpc_error, Reason}, State};
         {ok, Stream1, Msg, Rest} ->
             process_response(Msg, update_stream(Stream1, State#state{buf = Rest}))
     end.
@@ -175,12 +175,14 @@ is_normal(shutdown) -> true;
 is_normal({shutdown, _}) -> true;
 is_normal(_) -> false.
 
-send_watch_requests(Stream, []) -> Stream;
+send_watch_requests(Stream, []) -> {ok, Stream};
 send_watch_requests(Stream, [Req | Rest]) ->
     %% Send the create request.
     ?LOG_DEBUG("Sending watch request: ~p", [Req]),
-    Stream1 = egrpc_stream:send_msg(Stream, Req, nofin),
-    send_watch_requests(Stream1, Rest).
+    maybe
+        {ok, Stream1} ?= egrpc_stream:send_msg(Stream, Req, nofin),
+        send_watch_requests(Stream1, Rest)
+    end.
 
 recv_response_header(Stream, Timeout) ->
     Res = egrpc_stream:recv_header(Stream, Timeout),

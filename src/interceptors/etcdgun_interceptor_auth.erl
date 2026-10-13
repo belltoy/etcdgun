@@ -1,8 +1,7 @@
-%% @doc This module provides a gRPC interceptor that handles authentication for etcd gRPC requests.
-%% It adds authentication tokens to requests that require authentication and refreshes tokens when
-%% they expire.
+%% @doc This module handles authentication for etcd gRPC requests: the call credentials which add
+%% the token to the requests, and an interceptor which refreshes the token when it expires.
 %%
-%% See `authenticate/4' and `refresh_token/4' functions for implementation details.
+%% See `call_credentials/1' and `refresh_token/4' functions for implementation details.
 %%
 %% See also `t:egrpc_stub:unary_interceptor/0' for the type of gRPC unary interceptor.
 -module(etcdgun_interceptor_auth).
@@ -12,14 +11,15 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([
-    authenticate/4,
+    call_credentials/1,
     refresh_token/4
 ]).
 
-authenticate(Stream, Req, Opts, Next) ->
-    ?LOG_DEBUG("Authentication interceptor for RPC ~s.~s",
-               [egrpc_stream:grpc_service(Stream), egrpc_stream:grpc_method(Stream)]),
-    Service = atom_to_list(egrpc_stream:grpc_service(Stream)),
+%% @doc The call credentials of etcdgun channels, see `t:egrpc_stub:call_credentials/0'.
+%%
+%% It adds the token of the channel info to every call, streaming calls included.
+call_credentials(Stream) ->
+    Service = egrpc_stream:grpc_service(Stream),
     Method = egrpc_stream:grpc_method(Stream),
     %% Which RPCs require the token when authentication is enabled depends on the etcd version.
     %% Without a token, the RPC fails with "etcdserver: user name is empty" where `token' is shown
@@ -35,21 +35,19 @@ authenticate(Stream, Req, Opts, Next) ->
     %% of them except `Auth.Authenticate', which is how the token is obtained. When there is no
     %% token in the channel info yet, e.g. the authentication is not enabled, nothing is sent.
     ShouldAuth =
-        case {string:split(Service, ".", all), Method} of
-                {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
-                {["etcdserverpb", _], _} -> true;
-                {["v3electionpb", _], _} -> true;
-                {["v3lockpb", _], _} -> true;
-                {_, _} -> false
-            end,
-    maybe
-        true ?= ShouldAuth,
-        {ok, Token} ?= get_token(Stream),
-        Metadata = maps:get(metadata, Opts, #{}),
-        ?LOG_DEBUG("Authenticating in the interceptor for RPC ~s.~s", [Service, Method]),
-        Next(Stream, Req, Opts#{metadata => Metadata#{<<"token">> => Token}})
-    else
-        _ -> Next(Stream, Req, Opts)
+        case {string:split(atom_to_list(Service), ".", all), Method} of
+            {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
+            {["etcdserverpb", _], _} -> true;
+            {["v3electionpb", _], _} -> true;
+            {["v3lockpb", _], _} -> true;
+            {_, _} -> false
+        end,
+    case ShouldAuth andalso get_token(Stream) of
+        {ok, Token} ->
+            ?LOG_DEBUG("Authenticating RPC ~s.~s", [Service, Method]),
+            {ok, #{<<"token">> => Token}};
+        _ ->
+            {ok, #{}}
     end.
 
 get_token(Stream) ->

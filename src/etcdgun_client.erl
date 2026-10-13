@@ -125,7 +125,9 @@ init({Client, Endpoints, Opts0}) ->
             infinity -> infinity;
             _ -> ?MEMBERSHIP_CHECK_INTERVAL
         end,
-    Opts = maps:with([stream_interceptors, unary_interceptors], Opts0),
+    Opts = (maps:with([interceptors], Opts0))#{
+        call_credentials => fun etcdgun_interceptor_auth:call_credentials/1
+    },
     maybe
         %% Authenticate first, the RPCs of getting the members and checking them require the token
         %% in etcd 3.6 and 3.7 when authentication is enabled.
@@ -192,7 +194,7 @@ handle_call(pick_channel, _From, #state{actives = [{_M, Channel, _MRef} = P | Re
                 {undefined, Info} -> Info;
                 {Token, #{} = Info} -> Info#{token => Token}
             end,
-    Channel1 = egrpc_stub:set_info(Channel, Info1),
+    Channel1 = egrpc_stub:derive(Channel, #{info => Info1}),
     {reply, {ok, Channel1}, State#state{actives = Rest ++ [P]}};
 
 handle_call({update_cred, undefined}, _From, #state{cred = _Cred0} = State) ->
@@ -383,13 +385,13 @@ authenticate_bootstrap(Channel, Cred) ->
         Result -> Result
     end.
 
-%% Put the token into the channel info, the auth interceptors send it with the requests.
+%% Put the token into the channel info, the call credentials send it with the requests.
 with_token(Channel, undefined) -> Channel;
 with_token(Channel, Token) ->
     OldInfo = egrpc_stub:info(Channel, #{}),
     %% eqwalizer:ignore
     NewInfo = OldInfo#{token => Token},
-    egrpc_stub:set_info(Channel, NewInfo).
+    egrpc_stub:derive(Channel, #{info => NewInfo}).
 
 with_channel(Host, Port, Opts, Fun) ->
     maybe
