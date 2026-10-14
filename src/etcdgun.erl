@@ -136,6 +136,18 @@ close(Client) ->
 %% The reason which a monitor gets is `killed' or `noproc' when the watcher was killed or ended
 %% before it was monitored.
 %%
+%% <b>progress_notify</b>: the request may have `progress_notify => true', which is passed to the
+%% server as it is (it is `false' when not given): the server then sends a response without events
+%% now and then (when it decides to, by its configuration, it is a matter of minutes by default),
+%% which says that everything up to its revision was sent. The watcher takes it as the last
+%% revision. Without it the last revision stays at the revision of the last event, or of the
+%% creation of the watch, and a watch of a key which changes rarely starts from an old revision
+%% when it connects again after the connection was lost: if the store was compacted in the
+%% meantime that revision is gone, and the watcher stops with
+%% `{shutdown, {canceled, {compacted, Revision}}}', with `Revision' to start from (some events
+%% between are not seen). It is not an option which makes the events come sooner, the handler is
+%% not told of the responses without events.
+%%
 %% `{error, {invalid_handler, EventHandler}}' is returned when there is no handler: it is not a
 %% module which has `init/1' and `handle_event/2'. `{error, {handler_init, Reason}}' is returned
 %% when the initialisation of the handler fails.

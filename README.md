@@ -18,7 +18,8 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
 - [x] [interceptors](src/interceptors/) for more flexible needs, the token is sent by egrpc `call_credentials`.
 - [x] etcd authentication and auto-token-refreshing.
 - [x] lease keep alive [`etcdgun_lease_keepalive`](src/etcdgun_lease_keepalive.erl).
-- [x] watcher with auto-reconnect [`etcdgun_watcher`](src/etcdgun_watcher.erl).
+- [x] watcher with auto-reconnect and resuming from the last revision, see [Watch](#watch)
+  ([`etcdgun_watcher`](src/etcdgun_watcher.erl)).
 - [x] check the member list of the cluster periodically, and sync the connections with it
   ([`etcdgun_client`](src/etcdgun_client.erl), the `membership_check_interval` option).
 - [x] etcd endpoints health check when dial.
@@ -83,6 +84,91 @@ receive
     {'DOWN', MRef, process, Pid, {shutdown, lease_expired}} -> lease_is_gone
 end.
 ```
+
+### Watch
+
+`etcdgun:watch(Client, WatcherName, Handler, HandlerArgs, Request)` starts a watcher, which is one
+watch: `Request` is a `WatchCreateRequest` of etcd, e.g. `#{key => Key, range_end => RangeEnd,
+start_revision => Revision}`. The events are given to `Handler`, a module with the callbacks of a
+`gen_event` handler (`init/1`, `handle_event/2` and `terminate/2`), which is called by the watcher
+itself, in its process.
+
+```erlang
+-module(my_watch_handler).
+-export([init/1, handle_event/2, terminate/2]).
+
+init(Owner) -> {ok, Owner}.
+
+handle_event({watch_events, Events}, Owner) ->
+    [Owner ! {changed, Key, Value} || #{kv := #{key := Key, value := Value}} <- Events],
+    {ok, Owner};
+handle_event({watch_stopped, Reason, LastRevision}, Owner) ->
+    Owner ! {stopped, Reason, LastRevision},
+    {ok, Owner};
+%% The events which are not of interest, e.g. `watch_paused' and `watch_resumed'.
+handle_event(_Event, Owner) ->
+    {ok, Owner}.
+
+terminate(_Reason, _Owner) -> ok.
+```
+
+```erlang
+Prefix = <<"/app/config/">>,
+Request = #{key => Prefix, range_end => etcdgun:prefix_range_end(Prefix)},
+{ok, Watcher} = etcdgun:watch(my_client, my_watcher, my_watch_handler, self(), Request),
+%% The watcher is the lifecycle of the watch: the reason of its exit is how it ended.
+MRef = erlang:monitor(process, Watcher),
+
+receive
+    {changed, Key, Value} -> {Key, Value};
+    {'DOWN', MRef, process, Watcher, Reason} -> {watch_ended, Reason}
+end.
+```
+
+The events of the handler are:
+
+| Event | When |
+|---|---|
+| `{watch_events, Events}` | the events of the watch |
+| `{watch_paused, Reason, LastRevision}` | the connection is lost (or could not be made at the start); the watcher stays and connects again, no event is lost |
+| `{watch_resumed, LastRevision}` | the watch is created again, after a pause |
+| `{watch_stopped, Reason, LastRevision}` | the watcher stops, when it is able to (it is not when it is killed) |
+
+`LastRevision` is the revision of the last event which was given to the handler, `undefined` when
+the watch was not created yet. To watch again without a gap or a repeat, start from the one after
+it: `Request#{start_revision => LastRevision + 1}`.
+
+A handler must have a clause for the events which are not of interest. It returns `{ok, State}`,
+or `{cancel_watch, State}` to cancel the watch (it is the way to do it from the handler, calling
+`etcdgun:cancel_watch/2` or `etcdgun:close/1` there raises `called_from_the_handler`). Any other
+return, or an exception, is a crash of the handler: it is initialised again with `HandlerArgs`,
+its state and the events it was given are lost (they are given at most once), and the watcher
+stops with `{handler_failed, Reason}` when it happens more than 5 times in 10 seconds.
+
+The watcher does not give up when the network or the cluster is not available, it tries again
+every second. It stops, and is not restarted, when it is not going to change by trying again.
+Monitor the pid to know, the reason of the exit is:
+
+| Reason | |
+|---|---|
+| `shutdown` | `etcdgun:cancel_watch/2`, `etcdgun:close/1` of the client, the application is stopped, or the handler returned `{cancel_watch, State}` |
+| `{shutdown, {canceled, {compacted, Revision}}}` | the revision to start from is compacted, `Revision` is the one the store was compacted to |
+| `{shutdown, {canceled, Reason}}` | the server cancelled the watch, e.g. it is not allowed |
+| `{grpc_error, Status}` | the call was refused, not for the network or the availability of the server |
+| `{auth_failed, Reason}` | the token was refused again after it was refreshed, e.g. the credentials were changed or removed |
+| `{handler_failed, Reason}` | the handler crashed too often |
+
+Things to know:
+
+- The handler runs in the process of the watcher: a slow handler holds the watch back, and one
+  which does not return holds it for good.
+- A watcher which was killed is not able to tell the handler, and the `'DOWN'` has the reason
+  `killed`; keep the last revision in the state of the handler if it has to be known.
+- `fragment` is not supported (`{error, {unsupported_option, fragment}}`), and the `watch_id`
+  of the request is ignored.
+- The name `WatcherName` is registered locally, so it is one per node, whatever the client is.
+- A watch of a key which is changed rarely: see `progress_notify` in the documentation of
+  [`etcdgun:watch/5`](https://hexdocs.pm/etcdgun/etcdgun.html#watch/5).
 
 ### TLS
 
