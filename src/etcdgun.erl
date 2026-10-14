@@ -79,8 +79,24 @@ close(Client) ->
 %% @doc Start a watcher, which has one watch, with the create request `Request' (a
 %% `WatchCreateRequest' of etcd, e.g. `#{key => Key, range_end => RangeEnd}').
 %%
-%% The events are sent to the handler `EventHandler' (a `gen_event' handler module, initialised
-%% with `EventHandlerArgs'), and the pid which is returned is the watcher.
+%% The events are given to the handler `EventHandler' (a module with the callbacks of a
+%% `gen_event' handler, `init/1', `handle_event/2' and `terminate/2', or `{Module, Id}'), which is
+%% initialised with `EventHandlerArgs'. The pid which is returned is the watcher.
+%%
+%% The handler is called by the watcher, in its process, there is no event manager process: a
+%% slow handler holds the watch back. What a handler returns is what the watcher does:
+%% <ul>
+%%   <li>`{ok, State}': the next event is given to it;</li>
+%%   <li>`remove_handler': the watcher stops with the reason `normal';</li>
+%%   <li>an exception or any other return: it is initialised again with `EventHandlerArgs' (its
+%%       state is lost, and so is the event, which is given at most once), and the watcher stops
+%%       with `{handler_failed, Reason}' when that happens more than 5 times in 10 seconds.</li>
+%% </ul>
+%% The events are `{watch_events, Events}', `watch_canceled' and `{watch_stopped, Reason}'; a
+%% handler needs a clause for every event it does not care about, or it crashes at them. The
+%% callbacks `handle_call/2', `handle_info/2' and `code_change/3' are not called.
+%%
+%% `{error, {handler_init, Reason}}' is returned when the initialisation of the handler fails.
 %%
 %% `{error, {invalid_request, _}}' is returned when `Request' has no `key', and
 %% `{error, {unsupported_option, fragment}}' when it asks for fragments, which are not supported.

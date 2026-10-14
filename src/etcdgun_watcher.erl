@@ -8,8 +8,12 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([
-    start_link/4
+    start_link/5
 ]).
+
+%% The handler of the events is a `gen_event' handler module (or `{Module, Id}'), whose callbacks
+%% `init/1', `handle_event/2' and `terminate/2' are called by the watcher itself.
+-type handler() :: module() | {module(), term()}.
 
 -export([
     init/1,
@@ -31,7 +35,12 @@
     stream = undefined :: undefined | egrpc:stream(),
     monitor_ref = undefined :: undefined | reference(),
     conn_pid = undefined :: undefined | pid(),
-    event_manager_pid = undefined :: undefined | pid(),
+    %% The module of the handler, `undefined' when it is removed or was terminated.
+    handler = undefined :: undefined | module(),
+    handler_args :: term(),
+    handler_state :: term(),
+    %% The times of the latest crashes of the handler.
+    handler_crashes = [] :: [integer()],
     create_ref = undefined :: undefined | reference(),
     %% The response of the creation is not received yet.
     creating = false :: boolean(),
@@ -46,33 +55,47 @@
 -define(WATCH_EVENT_STOPPED(Reason), {watch_stopped, Reason}).
 
 -define(CONNECT_RETRY_INTERVAL, 1000).
+%% A handler which crashes more than this often in the period is given up, or a handler which
+%% crashes at every event would be initialised again and again.
+-define(HANDLER_MAX_CRASHES, 5).
+-define(HANDLER_CRASH_PERIOD, 10000).
 %% A watcher has one watch, with this id.
 -define(WATCH_ID, 1).
 
 %% TODO: Timeout, invalid auth token, reconnect, etc.
 
-start_link(Client, WatcherName, EventMgr, Request) ->
-    Args = {Client, WatcherName, EventMgr, Request},
+-spec start_link(atom(), atom(), handler(), term(), map()) -> gen_server:start_ret().
+start_link(Client, WatcherName, Handler, HandlerArgs, Request) ->
+    Args = {Client, WatcherName, Handler, HandlerArgs, Request},
     gen_server:start_link({local, WatcherName}, ?MODULE, Args, []).
 
 %%-------------------------------------------------------------------
 %% gen_server callbacks
 %%-------------------------------------------------------------------
 
-init({Client, WatcherName, EventMgr, Request}) ->
+init({Client, WatcherName, Handler, HandlerArgs, Request}) ->
     ?LOG_INFO("Starting watcher ~p for client ~p", [WatcherName, Client]),
     process_flag(trap_exit, true),
-    State = #state{
-        client = Client,
-        watcher_name = WatcherName,
-        request = Request#{watch_id => ?WATCH_ID},
-        event_manager_pid = EventMgr
-    },
-    %% The first attempt is made here, so that the watch is created when `etcdgun:watch/5'
-    %% returns, as a put right after it is expected to be seen. When it fails the watcher stays
-    %% and retries, as a failed start would be restarted at once by the supervisor, again and
-    %% again, which is why it slept here before (blocking the supervisor).
-    {ok, try_connect(State)}.
+    Module = handler_module(Handler),
+    case init_handler(Module, HandlerArgs) of
+        {ok, HandlerState} ->
+            State = #state{
+                client = Client,
+                watcher_name = WatcherName,
+                request = Request#{watch_id => ?WATCH_ID},
+                handler = Module,
+                handler_args = HandlerArgs,
+                handler_state = HandlerState
+            },
+            %% The first attempt is made here, so that the watch is created when
+            %% `etcdgun:watch/5' returns, as a put right after it is expected to be seen. When it
+            %% fails the watcher stays and retries, as a failed start would be restarted at once by
+            %% the supervisor, again and again, which is why it slept here before (blocking the
+            %% supervisor).
+            {ok, try_connect(State)};
+        {error, Reason} ->
+            {stop, {handler_init, Reason}}
+    end.
 
 try_connect(State) ->
     case connect(State) of
@@ -202,8 +225,7 @@ terminate(Reason, State) ->
     % is_normal(Reason) andalso cancel_watches(State),
     is_reference(State#state.monitor_ref) andalso erlang:demonitor(State#state.monitor_ref, [flush]),
     cancel_stream(State),
-    notify(?WATCH_EVENT_STOPPED(Reason), State),
-    ok.
+    stop_handler(Reason, State).
 
 %%-------------------------------------------------------------------
 %% Private functions
@@ -226,6 +248,92 @@ disconnect(#state{monitor_ref = MRef, create_ref = CreateRef} = State) ->
     State#state{stream = undefined, stream_ref = undefined, monitor_ref = undefined,
                 conn_pid = undefined, create_ref = undefined, creating = false, buf = <<>>}.
 
+%% The handler is a module or `{Module, Id}', as for `gen_event'.
+handler_module({Module, _Id}) when is_atom(Module) -> Module;
+handler_module(Module) when is_atom(Module) -> Module.
+
+init_handler(Module, Args) ->
+    try Module:init(Args) of
+        {ok, HandlerState} -> {ok, HandlerState};
+        {ok, HandlerState, hibernate} -> {ok, HandlerState};
+        {error, _} = Error -> Error;
+        Other -> {error, {bad_return_value, Other}}
+    catch
+        Class:Reason -> {error, {Class, Reason}}
+    end.
+
+%% Give an event to the handler, in this process: what it returns is what the watcher does, there
+%% is no other process which could drop it silently.
+%%
+%% - `{ok, State}': go on.
+%% - `remove_handler': the handler does not want events, the watch has no purpose, the watcher
+%%   stops with `normal'.
+%% - a crash (an exception, or a return which is not understood): the handler is initialised
+%%   again and the event is lost; the watcher stops when that happens too often.
+-spec dispatch(term(), #state{}) -> {ok, #state{}} | {stop, term(), #state{}}.
+dispatch(_Event, #state{handler = undefined} = State) ->
+    {ok, State};
+dispatch(Event, #state{handler = Module, handler_state = HandlerState} = State) ->
+    try Module:handle_event(Event, HandlerState) of
+        {ok, HandlerState1} ->
+            {ok, State#state{handler_state = HandlerState1}};
+        {ok, HandlerState1, hibernate} ->
+            {ok, State#state{handler_state = HandlerState1}};
+        remove_handler ->
+            ?LOG_INFO("Watcher ~p: the handler ~p was removed by its return, stop",
+                      [State#state.watcher_name, Module]),
+            catch_terminate(Module, remove_handler, HandlerState),
+            {stop, normal, State#state{handler = undefined}};
+        Other ->
+            handler_crashed({bad_return_value, Other}, State)
+    catch
+        Class:Reason:Stacktrace ->
+            handler_crashed({Class, Reason, Stacktrace}, State)
+    end.
+
+handler_crashed(Reason, #state{handler = Module, handler_state = HandlerState,
+                               handler_args = Args} = State) ->
+    ?LOG_ERROR("Watcher ~p: the handler ~p crashed: ~p, initialise it again",
+               [State#state.watcher_name, Module, Reason]),
+    catch_terminate(Module, {error, Reason}, HandlerState),
+    Now = erlang:monotonic_time(millisecond),
+    Crashes = [T || T <- [Now | State#state.handler_crashes], Now - T < ?HANDLER_CRASH_PERIOD],
+    case length(Crashes) > ?HANDLER_MAX_CRASHES of
+        true ->
+            {stop, {handler_failed, Reason}, State#state{handler = undefined}};
+        false ->
+            case init_handler(Module, Args) of
+                {ok, HandlerState1} ->
+                    {ok, State#state{handler_state = HandlerState1, handler_crashes = Crashes}};
+                {error, InitReason} ->
+                    {stop, {handler_failed, {init, InitReason}}, State#state{handler = undefined}}
+            end
+    end.
+
+%% The watcher stops: the handler is told, and terminated. It does not have to be there anymore,
+%% and whatever it does is not of interest for the way the watcher stops.
+stop_handler(_Reason, #state{handler = undefined}) ->
+    ok;
+stop_handler(Reason, #state{handler = Module, handler_state = HandlerState}) ->
+    HandlerState1 =
+        try Module:handle_event(?WATCH_EVENT_STOPPED(Reason), HandlerState) of
+            {ok, S} -> S;
+            {ok, S, hibernate} -> S;
+            _ -> HandlerState
+        catch
+            _:_ -> HandlerState
+        end,
+    catch_terminate(Module, Reason, HandlerState1).
+
+catch_terminate(Module, Reason, HandlerState) ->
+    try
+        Module:terminate(Reason, HandlerState)
+    catch
+        Class:Error ->
+            ?LOG_WARNING("The terminate of the handler ~p failed: ~p:~p", [Module, Class, Error])
+    end,
+    ok.
+
 is_normal(normal) -> true;
 is_normal(shutdown) -> true;
 is_normal({shutdown, _}) -> true;
@@ -247,11 +355,17 @@ process_response(#{canceled := true} = Response, State) ->
 %% A progress notification which is for all the watches of the stream has no id of the watch.
 process_response(#{created := false, canceled := false} = Response, State) ->
     %% A progress notification has no events, there is nothing to tell the handler.
-    case maps:get(events, Response, []) of
-        [] -> ok;
-        Events -> notify(?WATCH_EVENT_EVENTS(Events), State)
-    end,
-    {noreply, State#state{last_revision = last_revision(Response)}, {continue, process_data}};
+    Result = case maps:get(events, Response, []) of
+                 [] -> {ok, State};
+                 Events -> dispatch(?WATCH_EVENT_EVENTS(Events), State)
+             end,
+    case Result of
+        {ok, State1} ->
+            {noreply, State1#state{last_revision = last_revision(Response)},
+             {continue, process_data}};
+        {stop, Reason, State1} ->
+            {stop, Reason, State1}
+    end;
 process_response(Response, State) ->
     %% Whatever else, e.g. a response of a watch which was not created, must not stall the
     %% messages which are in the buffer.
@@ -278,8 +392,11 @@ canceled(Response, State) ->
     canceled_by_request(Response, State).
 
 canceled_by_request(#{watch_id := WatchId}, State) ->
-    notify({?WATCH_EVENT_CANCELED, WatchId}, State),
-    {stop, {shutdown, canceled}, State}.
+    State1 = case dispatch({?WATCH_EVENT_CANCELED, WatchId}, State) of
+                 {ok, S} -> S;
+                 {stop, _, S} -> S
+             end,
+    {stop, {shutdown, canceled}, State1}.
 
 is_auth_error(Reason) ->
     lists:any(fun(Text) -> binary:match(Reason, Text) =/= nomatch end,
@@ -304,8 +421,6 @@ last_revision(#{events := [_ | _] = Events}) ->
 last_revision(#{header := #{revision := Revision}}) ->
     Revision.
 
-notify(Event, #state{event_manager_pid = Pid}) when is_pid(Pid) ->
-    gen_event:notify(Pid, Event).
 
 cancel_stream(#state{conn_pid = ConnPid, stream_ref = StreamRef})
   when is_pid(ConnPid), is_reference(StreamRef) ->
