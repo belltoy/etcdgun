@@ -380,7 +380,10 @@ process_response(#{created := true,
                  #state{creating = true} = State) ->
     ?LOG_INFO("Watcher ~p created the watch, revision ~p", [State#state.watcher_name, Rev]),
     LastRevision = created_revision(Rev, State),
-    State1 = State#state{creating = false, last_revision = LastRevision, auth_failures = 0},
+    %% The creation did not time out.
+    is_reference(State#state.create_ref) andalso erlang:cancel_timer(State#state.create_ref),
+    State1 = State#state{creating = false, create_ref = undefined, last_revision = LastRevision,
+                         auth_failures = 0},
     case resumed(State1) of
         {ok, State2} -> {noreply, State2, {continue, process_data}};
         {stop, Reason, State2} -> {stop, Reason, State2}

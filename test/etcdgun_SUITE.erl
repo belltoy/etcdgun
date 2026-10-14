@@ -274,6 +274,13 @@ watch_events(_Config) ->
     ?assertMatch([#{kv := #{key := Key, value := <<"1">>}}], recv_events()),
     put_retry(Key, <<"2">>),
     ?assertMatch([#{kv := #{key := Key, value := <<"2">>}}], recv_events()),
+    %% The handler is told about a pause and a resume only when the watch was interrupted, not
+    %% for the creation of it.
+    receive
+        {watch_event, {watch_paused, _, _}} -> ct:fail(watch_paused);
+        {watch_event, {watch_resumed, _}} -> ct:fail(watch_resumed)
+    after 0 -> ok
+    end,
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
 %% The watcher stays when its connection is down (it is the same process), and resumes from the
