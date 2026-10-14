@@ -71,11 +71,11 @@ kv_and_members(Config) ->
 watch_and_lease(Config) ->
     {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, opts(Config)),
     Prefix = key(),
-    Req = #{request_union => {create_request, #{
+    Req = #{
         key => Prefix,
         range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix))
-    }}},
-    {ok, _} = etcdgun:watch(?CLIENT, tls_watcher, etcdgun_ct_handler, self(), [Req]),
+    },
+    {ok, _} = etcdgun:watch(?CLIENT, tls_watcher, etcdgun_ct_handler, self(), Req),
     {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
     Key = <<Prefix/binary, "/a">>,
     {ok, _} = etcdgun_etcdserverpb_kv_client:put(Channel, #{key => Key, value => <<"1">>}),

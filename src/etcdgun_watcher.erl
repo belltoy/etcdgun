@@ -26,7 +26,8 @@
 -record(state, {
     client :: atom(),
     watcher_name :: atom(),
-    requests :: [map()],
+    %% The create request, without the revision to resume from.
+    request :: map(),
     connect_ref = undefined :: undefined | reference(),
     stream_ref = undefined :: undefined | reference(),
     stream = undefined :: undefined | egrpc:stream(),
@@ -34,8 +35,8 @@
     conn_pid = undefined :: undefined | pid(),
     event_manager_pid = undefined :: undefined | pid(),
     create_ref = undefined :: undefined | reference(),
-    creatings = [] :: [WatchId :: integer()],
-    watches = #{} :: #{WatchId :: integer() => Revision :: integer()},
+    %% The response of the creation is not received yet.
+    creating = false :: boolean(),
     buf = <<>> :: binary()
 }).
 
@@ -45,6 +46,8 @@
 
 -define(WATCH_CACHE_TABLE, etcdgun_watcher_cache).
 -define(CONNECT_RETRY_INTERVAL, 1000).
+%% A watcher has one watch, with this id.
+-define(WATCH_ID, 1).
 
 -record(watcher_cache, {
     watcher_name :: atom(),
@@ -69,21 +72,21 @@ create_watch_cache_table() ->
         _Info -> ok
     end.
 
-start_link(Client, WatcherName, EventMgr, WatchRequests) ->
-    Args = {Client, WatcherName, EventMgr, WatchRequests},
+start_link(Client, WatcherName, EventMgr, Request) ->
+    Args = {Client, WatcherName, EventMgr, Request},
     gen_server:start_link({local, WatcherName}, ?MODULE, Args, []).
 
 %%-------------------------------------------------------------------
 %% gen_server callbacks
 %%-------------------------------------------------------------------
 
-init({Client, WatcherName, EventMgr, WatchRequests}) ->
+init({Client, WatcherName, EventMgr, Request}) ->
     ?LOG_INFO("Starting watcher ~p for client ~p", [WatcherName, Client]),
     process_flag(trap_exit, true),
     State = #state{
         client = Client,
         watcher_name = WatcherName,
-        requests = assign_watch_id(WatchRequests),
+        request = Request#{watch_id => ?WATCH_ID},
         event_manager_pid = EventMgr
     },
     %% The first attempt is made here, so that the watch is created when `etcdgun:watch/5'
@@ -103,28 +106,26 @@ try_connect(State) ->
             State#state{connect_ref = TRef}
     end.
 
-%% Open the watch stream and send the create requests.
-connect(#state{client = Client, watcher_name = WatcherName, requests = Requests} = State) ->
+%% Open the watch stream and send the create request.
+connect(#state{client = Client, watcher_name = WatcherName, request = Request} = State) ->
     maybe
         {ok, Channel} ?= pick_channel(Client),
         {ok, Stream} ?= etcdgun_etcdserverpb_watch_client:watch(Channel),
-        %% Load the last revisions if the watcher is being restarted.
-        WatchRequests = load_last_revision(WatcherName, Requests),
-        case create_watches(Stream, WatchRequests) of
+        %% Load the last revision if the watcher is being restarted.
+        Request1 = load_last_revision(WatcherName, Request),
+        case create_watch(Stream, Request1) of
             {ok, Stream1} ->
                 %% Monitor the gun connection pid.
                 ConnPid = egrpc_stub:conn_pid(Stream1),
                 MRef = erlang:monitor(process, ConnPid),
                 TRef = erlang:start_timer(5000, self(), create_watch_timeout),
-                WatchIds =
-                    [I || #{request_union := {create_request, #{watch_id := I}}} <- Requests],
                 {ok, State#state{
                     stream = Stream1,
                     stream_ref = egrpc_stream:stream_ref(Stream1),
                     monitor_ref = MRef,
                     conn_pid = ConnPid,
                     create_ref = TRef,
-                    creatings = WatchIds,
+                    creating = true,
                     buf = <<>>
                 }};
             {error, _} = Error ->
@@ -133,10 +134,12 @@ connect(#state{client = Client, watcher_name = WatcherName, requests = Requests}
         end
     end.
 
-%% Send the create requests, and receive the response header.
-create_watches(Stream, WatchRequests) ->
+%% Send the create request, and receive the response header.
+create_watch(Stream, Request) ->
     maybe
-        {ok, Stream1} ?= send_watch_requests(Stream, WatchRequests),
+        ?LOG_DEBUG("Sending watch request: ~p", [Request]),
+        {ok, Stream1} ?= egrpc_stream:send_msg(
+                           Stream, #{request_union => {create_request, Request}}, nofin),
         egrpc_stream:recv_header(Stream1, 5000)
     end.
 
@@ -157,7 +160,7 @@ handle_info({timeout, TRef, connect}, #state{connect_ref = TRef} = State) ->
     {noreply, try_connect(State#state{connect_ref = undefined})};
 
 handle_info({timeout, TRef, create_watch_timeout},
-            #state{create_ref = TRef, creatings = []} = State) ->
+            #state{create_ref = TRef, creating = false} = State) ->
     {noreply, State#state{create_ref = undefined}};
 handle_info({timeout, TRef, create_watch_timeout},
             #state{create_ref = TRef} = State) ->
@@ -222,34 +225,16 @@ is_normal(shutdown) -> true;
 is_normal({shutdown, _}) -> true;
 is_normal(_) -> false.
 
-send_watch_requests(Stream, []) -> {ok, Stream};
-send_watch_requests(Stream, [Req | Rest]) ->
-    %% Send the create request.
-    ?LOG_DEBUG("Sending watch request: ~p", [Req]),
-    maybe
-        {ok, Stream1} ?= egrpc_stream:send_msg(Stream, Req, nofin),
-        send_watch_requests(Stream1, Rest)
-    end.
-
 process_response(#{created := true,
                    canceled := false,
-                   watch_id := WatchId, header := #{revision := Rev}} = Response,
-                 #state{creatings = CreatingWatches, watches = Watches} = State) ->
-    maybe
-        true ?= lists:member(WatchId, State#state.creatings),
-        ?LOG_INFO("Watcher ~p created watch with ID ~p, revision ~p",
-                  [State#state.watcher_name, WatchId, Rev]),
-        Rest = CreatingWatches -- [WatchId],
-        length(Rest) =:= 0 andalso ?LOG_INFO("All watches created for watcher ~p",
-                                             [State#state.watcher_name]),
-        {noreply, State#state{creatings = Rest, watches = Watches#{WatchId => Rev}},
-         {continue, process_data}}
-    else
-        _ ->
-            ?LOG_WARNING("Watcher ~p received unexpected create response: ~p",
-                      [State#state.watcher_name, Response]),
-            {noreply, State, {continue, process_data}}
-    end;
+                   watch_id := ?WATCH_ID, header := #{revision := Rev}},
+                 #state{creating = true} = State) ->
+    ?LOG_INFO("Watcher ~p created the watch, revision ~p", [State#state.watcher_name, Rev]),
+    {noreply, State#state{creating = false}, {continue, process_data}};
+process_response(#{created := true} = Response, State) ->
+    ?LOG_WARNING("Watcher ~p received unexpected create response: ~p",
+                 [State#state.watcher_name, Response]),
+    {noreply, State, {continue, process_data}};
 process_response(#{canceled := true} = Response, State) ->
     canceled(Response, State);
 process_response(#{created := false, canceled := false, watch_id := WatchId} = Response, State) ->
@@ -325,29 +310,15 @@ cancel_stream(#state{}) ->
 update_stream(Stream, #state{} = State) ->
     State#state{stream = Stream}.
 
-assign_watch_id(WatchRequests) ->
-    lists:map(
-        fun({WatchId, #{request_union := {create_request, Req}}}) when is_map(Req) ->
-                Req1 = Req#{watch_id => WatchId},
-                #{request_union => {create_request, Req1}}
-        end, lists:enumerate(WatchRequests)).
-
 % If the watcher was previously registered, we can start from the last revision.
 % This is useful for resuming watches after a disconnect.
-load_last_revision(WatcherName, WatchRequests) ->
-    LastRevisions = case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
-                        [] -> #{};
-                        [#watcher_cache{last_revisions = LastRevisions0}] -> LastRevisions0
-                    end,
-    lists:map(
-        fun(#{request_union := {create_request, #{watch_id := WatchId} = Req}} = Req0) ->
-                case maps:get(WatchId, LastRevisions, undefined) of
-                    undefined -> Req0;
-                    LastRevision ->
-                        Req1 = Req#{start_revision => LastRevision + 1},
-                        #{request_union => {create_request, Req1}}
-                end
-        end, WatchRequests).
+load_last_revision(WatcherName, Request) ->
+    case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
+        [#watcher_cache{last_revisions = #{?WATCH_ID := LastRevision}}] ->
+            Request#{start_revision => LastRevision + 1};
+        _ ->
+            Request
+    end.
 
 update_last_revision(WatcherName, WatchId, LastRev) ->
     case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
@@ -374,9 +345,8 @@ is_auth_error_test() ->
 %% The responses of one data chunk are all handled: the handling of a response ends with a
 %% continue, until the buffer has no complete message.
 process_data_handles_all_responses_test() ->
-    Created = fun(Id) ->
-        #{created => true, canceled => false, watch_id => Id, header => #{revision => 10 + Id}}
-    end,
+    Created = #{created => true, canceled => false, watch_id => ?WATCH_ID,
+                header => #{revision => 11}},
     Frame = fun(Term) -> Bin = term_to_binary(Term), <<(byte_size(Bin)):32, Bin/binary>> end,
     %% The decoding is not what is tested, the messages are terms with a length.
     Parse = fun(_Stream, <<Len:32, Bin:Len/binary, Rest/binary>>) ->
@@ -384,25 +354,23 @@ process_data_handles_all_responses_test() ->
                (_Stream, _Buf) ->
                     more
             end,
-    Buf = iolist_to_binary([Frame(Created(Id)) || Id <- [1, 2, 3]]),
-    State = #state{
-        client = c, watcher_name = w, requests = [],
-        stream = stream, creatings = [1, 2, 3], buf = Buf
-    },
     Drain = fun Drain(S) ->
         case process_data(S, Parse) of
             {noreply, S1, {continue, process_data}} -> Drain(S1);
             {noreply, S1} -> S1
         end
     end,
-    Final = Drain(State),
-    ?assertEqual([], Final#state.creatings),
-    ?assertEqual(#{1 => 11, 2 => 12, 3 => 13}, Final#state.watches),
+    State = #state{client = c, watcher_name = w, request = #{}, stream = stream, creating = true},
+    %% every response of the chunk is handled, even when a create response is repeated
+    Buf = iolist_to_binary([Frame(Created), Frame(Created), Frame(Created)]),
+    Final = Drain(State#state{buf = Buf}),
+    ?assertEqual(false, Final#state.creating),
     ?assertEqual(<<>>, Final#state.buf),
     %% a response which is not understood does not stall the ones after it
-    Odd = iolist_to_binary([Frame(#{something => other}), Frame(Created(1))]),
-    Final1 = Drain(State#state{creatings = [1], buf = Odd}),
-    ?assertEqual([], Final1#state.creatings).
+    Odd = iolist_to_binary([Frame(#{something => other}), Frame(Created)]),
+    Final1 = Drain(State#state{buf = Odd}),
+    ?assertEqual(false, Final1#state.creating),
+    ?assertEqual(<<>>, Final1#state.buf).
 
 last_revision_test() ->
     Kv = fun(R) -> #{kv => #{key => <<"k">>, mod_revision => R}} end,

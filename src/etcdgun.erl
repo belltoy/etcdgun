@@ -76,8 +76,18 @@ open(Client, Endpoints, Opts) ->
 close(Client) ->
     etcdgun_client_sup:stop_child(Client).
 
-watch(Client, WatcherName, EventHandler, EventHandlerArgs, Requests) ->
-    etcdgun_watcher_sup:start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Requests).
+%% @doc Start a watcher, which has one watch, with the create request `Request' (a
+%% `WatchCreateRequest' of etcd, e.g. `#{key => Key, range_end => RangeEnd}').
+%%
+%% The events are sent to the handler `EventHandler' (a `gen_event' handler module, initialised
+%% with `EventHandlerArgs'), and the pid which is returned is the watcher.
+%%
+%% `{error, {invalid_request, _}}' is returned when `Request' has no `key', and
+%% `{error, {unsupported_option, fragment}}' when it asks for fragments, which are not supported.
+%% The `watch_id' of the request is ignored.
+-spec watch(client(), atom(), module(), term(), map()) -> {ok, pid()} | {error, Reason :: term()}.
+watch(Client, WatcherName, EventHandler, EventHandlerArgs, Request) ->
+    etcdgun_watcher_sup:start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Request).
 
 cancel_watch(Client, WatcherName) ->
     etcdgun_watcher_sup:stop_child(Client, WatcherName).

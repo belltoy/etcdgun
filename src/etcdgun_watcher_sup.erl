@@ -14,13 +14,31 @@ start_link() ->
     etcdgun_watcher:create_watch_cache_table(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
-start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Requests) ->
+start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Request) ->
+    case validate_request(Request) of
+        ok -> do_start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Request);
+        {error, _} = Error -> Error
+    end.
 
+%% A watcher has one watch, `Request' is the create request of it.
+validate_request(#{key := Key} = Request) when is_binary(Key), Key =/= <<>> ->
+    case maps:get(fragment, Request, false) of
+        false -> ok;
+        %% The events of a revision may be split over the fragments, the revision to resume from
+        %% would not be right between them.
+        _ -> {error, {unsupported_option, fragment}}
+    end;
+validate_request(#{}) ->
+    {error, {invalid_request, key}};
+validate_request(_) ->
+    {error, {invalid_request, not_a_map}}.
+
+do_start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Request) ->
     {ok, EventMgr} = etcdgun_event_manager_sup:start_event_manager(),
     try
         case gen_event:add_handler(EventMgr, EventHandler, EventHandlerArgs) of
             ok ->
-                Args = [Client, WatcherName, EventMgr, Requests],
+                Args = [Client, WatcherName, EventMgr, Request],
                 Child = #{
                     id => {Client, WatcherName},
                     start => {etcdgun_watcher, start_link, Args},

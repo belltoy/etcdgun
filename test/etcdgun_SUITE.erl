@@ -24,7 +24,8 @@
     member_add_remove/1,
     learner_member/1,
     leader_change/1,
-    watch_many_creates/1,
+    watch_many_watchers/1,
+    watch_invalid_request/1,
     watch_recreate_same_name/1,
     watch_replay_from_start/1,
     watch_without_connection/1,
@@ -58,7 +59,8 @@ all() ->
         member_add_remove,
         learner_member,
         leader_change,
-        watch_many_creates,
+        watch_many_watchers,
+        watch_invalid_request,
         watch_recreate_same_name,
         watch_replay_from_start,
         watch_without_connection,
@@ -246,7 +248,7 @@ token_refresh(_Config) ->
 
 watch_events(_Config) ->
     Prefix = key(),
-    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
     Key = <<Prefix/binary, "/a">>,
     put_retry(Key, <<"1">>),
     ?assertMatch([#{kv := #{key := Key, value := <<"1">>}}], recv_events()),
@@ -258,7 +260,7 @@ watch_events(_Config) ->
 %% the event which happened while it was down is not lost.
 watch_reconnect(_Config) ->
     Prefix = key(),
-    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
     A = <<Prefix/binary, "/a">>,
     B = <<Prefix/binary, "/b">>,
     put_retry(A, <<"1">>),
@@ -349,20 +351,37 @@ learner_member(_Config) ->
         ok = wait_until({three, Ctl}, fun() -> members() =:= 3 andalso actives() =:= 3 end, 90)
     end).
 
-%% Several watches are created by one watcher, their create responses arrive together. They all
-%% have to be handled, or the watcher stops after the create timeout.
-watch_many_creates(_Config) ->
+%% Many watchers at once, each one has its own watch and gets only its events.
+watch_many_watchers(_Config) ->
     Prefix = key(),
     %% The trailing slash: `/1' would also be the prefix of `/10' and `/100'.
-    Prefixes = [<<Prefix/binary, "/", (integer_to_binary(I))/binary, "/">> || I <- lists:seq(1, 100)],
-    Reqs = [watch_req(P) || P <- Prefixes],
-    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), Reqs),
-    %% Longer than the create timeout of the watcher.
-    timer:sleep(6500),
-    ?assert(is_process_alive(Pid)),
-    [put_retry(<<P/binary, "k">>, <<"v">>) || P <- Prefixes],
-    Keys = lists:sort([<<P/binary, "k">> || P <- Prefixes]),
-    ?assertEqual(Keys, lists:sort(recv_keys(length(Keys), 10000))),
+    Prefixes = [<<Prefix/binary, "/", (integer_to_binary(I))/binary, "/">> || I <- lists:seq(1, 30)],
+    Names = [list_to_atom("ct_watcher_" ++ integer_to_list(I)) || I <- lists:seq(1, 30)],
+    try
+        Pids = [begin
+                    {ok, Pid} = etcdgun:watch(?CLIENT, N, etcdgun_ct_handler, self(), watch_req(P)),
+                    Pid
+                end || {N, P} <- lists:zip(Names, Prefixes)],
+        ?assertEqual(30, length(lists:usort(Pids))),
+        [put_retry(<<P/binary, "k">>, <<"v">>) || P <- Prefixes],
+        Keys = lists:sort([<<P/binary, "k">> || P <- Prefixes]),
+        ?assertEqual(Keys, lists:sort(recv_keys(length(Keys), 10000)))
+    after
+        [_ = etcdgun:cancel_watch(?CLIENT, N) || N <- Names]
+    end.
+
+%% The request is checked before anything is started.
+watch_invalid_request(_Config) ->
+    Valid = watch_req(key()),
+    H = etcdgun_ct_handler,
+    Watch = fun(Req) -> etcdgun:watch(?CLIENT, ct_watcher, H, self(), Req) end,
+    ?assertEqual({error, {invalid_request, key}}, Watch(maps:remove(key, Valid))),
+    ?assertEqual({error, {invalid_request, key}}, Watch(Valid#{key := <<>>})),
+    ?assertEqual({error, {invalid_request, not_a_map}}, Watch([Valid])),
+    ?assertEqual({error, {unsupported_option, fragment}}, Watch(Valid#{fragment => true})),
+    ?assertEqual(undefined, whereis(ct_watcher)),
+    %% `fragment => false' is what the server does by default
+    {ok, _} = Watch(Valid#{fragment => false}),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
 %% The watcher of a name which was cancelled starts from what the request says, not from the last
@@ -372,19 +391,19 @@ watch_recreate_same_name(_Config) ->
     A = <<Prefix/binary, "/a">>,
     B = <<Prefix/binary, "/b">>,
     C = <<Prefix/binary, "/c">>,
-    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
     Rev = put_retry(A, <<"1">>),
     put_retry(B, <<"2">>),
     ?assertEqual([A, B], recv_keys(2, 5000)),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher),
     put_retry(C, <<"3">>),
     %% All the events since the first put are expected again.
-    Req = #{request_union => {create_request, #{
+    Req = #{
         key => Prefix,
         range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix)),
         start_revision => Rev
-    }}},
-    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [Req]),
+    },
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), Req),
     ?assertEqual([A, B, C], recv_keys(3, 5000)),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
@@ -396,12 +415,12 @@ watch_replay_from_start(_Config) ->
     Prefix = key(),
     Keys = [<<Prefix/binary, "/", (integer_to_binary(I))/binary>> || I <- lists:seq(1000, 3499)],
     [Rev | _] = [put_retry(K, <<"v">>) || K <- Keys],
-    Req = #{request_union => {create_request, #{
+    Req = #{
         key => Prefix,
         range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix)),
         start_revision => Rev
-    }}},
-    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [Req]),
+    },
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), Req),
     First = recv_keys(1, 10000),
     ?assert(length(First) < length(Keys)),
     %% The connection is lost while the history is being sent.
@@ -467,7 +486,7 @@ watch_without_connection(_Config) ->
     try
         ok = wait_until(fun() -> actives() =:= 0 end, 60),
         {Time, Res} = timer:tc(fun() ->
-            etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)])
+            etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix))
         end),
         ?assertMatch({ok, _}, Res),
         %% The supervisor is not blocked by a watcher which can not connect.
@@ -489,7 +508,7 @@ watch_without_connection(_Config) ->
 %% The leader moves to another member, the watcher and the lease keepalive keep working.
 leader_change(_Config) ->
     Prefix = key(),
-    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), [watch_req(Prefix)]),
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
     {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
     {ok, #{'ID' := LeaseId}} =
         etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 3}),
@@ -646,10 +665,10 @@ key() ->
     iolist_to_binary(["/etcdgun_ct/", integer_to_binary(erlang:unique_integer([positive]))]).
 
 watch_req(Prefix) ->
-    #{request_union => {create_request, #{
+    #{
         key => Prefix,
         range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix))
-    }}}.
+    }.
 
 %% The watch events of one `watch_events' message.
 recv_events() -> recv_events(5000).
