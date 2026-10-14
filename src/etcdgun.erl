@@ -94,9 +94,40 @@ close(Client) ->
 %%       state is lost, and so is the event, which is given at most once), and the watcher stops
 %%       with `{handler_failed, Reason}' when that happens more than 5 times in 10 seconds.</li>
 %% </ul>
-%% The events are `{watch_events, Events}', `watch_canceled' and `{watch_stopped, Reason}'; a
-%% handler needs a clause for every event it does not care about, or it crashes at them. The
-%% callbacks `handle_call/2', `handle_info/2' and `code_change/3' are not called.
+%% The events are:
+%% <ul>
+%%   <li>`{watch_events, Events}';</li>
+%%   <li>`{watch_paused, Reason, LastRevision}', once, when the connection is lost (or can not be
+%%       made): the watcher stays, connects again and resumes after the last revision, no event
+%%       is lost;</li>
+%%   <li>`{watch_resumed, LastRevision}', when the watch is created again;</li>
+%%   <li>`{watch_stopped, Reason, LastRevision}', when the watcher stops, as far as it is able
+%%       to: it is not when it is killed.</li>
+%% </ul>
+%% `LastRevision' is the revision of the last event which was given to the handler, or `undefined'
+%% when the watch was not created yet; to watch again without a gap or a repeat, watch from
+%% `LastRevision + 1' (`start_revision' of the request). A handler needs a clause for every event
+%% it does not care about, or it crashes at them. The callbacks `handle_call/2', `handle_info/2'
+%% and `code_change/3' are not called.
+%%
+%% The watcher is the lifecycle of the watch, monitor the pid which is returned: it does not give
+%% up when the network or the cluster is not available, and it is not restarted when it stops.
+%% The reason of the exit is:
+%% <ul>
+%%   <li>`shutdown': `cancel_watch/2', `close/1' of the client, or the application is stopped;</li>
+%%   <li>`normal': the handler returned `remove_handler';</li>
+%%   <li>`{shutdown, {canceled, {compacted, Revision}}}': the revision to start from was
+%%       compacted, it is `Revision' which the store is compacted to;</li>
+%%   <li>`{shutdown, {canceled, Reason}}': the server cancelled the watch (it is not allowed, ...);</li>
+%%   <li>`{grpc_error, Status}': the call was refused, not for the network or the availability of the
+%%       server;</li>
+%%   <li>`{auth_failed, Reason}': the token was refused again after it was refreshed, e.g. the
+%%       credentials were changed or removed;</li>
+%%   <li>`{handler_failed, Reason}': the handler crashed too often;</li>
+%%   <li>any other: it crashed.</li>
+%% </ul>
+%% The reason which a monitor gets is `killed' or `noproc' when the watcher was killed or ended
+%% before it was monitored.
 %%
 %% `{error, {handler_init, Reason}}' is returned when the initialisation of the handler fails.
 %%
