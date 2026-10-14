@@ -32,11 +32,21 @@
     cached_token/1,
     normalize_cred/1,
     refresh_token/1,
+    refresh_token/2,
     sync_membership/2
 ]).
 
 -type member() :: etcdgun_rpc_pb:'etcdserverpb.Member'().
 -type member_id() :: non_neg_integer().
+
+%% The refresh in progress. `cred' is what it authenticates with, the result is dropped when the
+%% credentials changed in the meantime.
+-record(refresh, {
+    pid :: pid(),
+    mref :: reference(),
+    cred :: {binary(), binary()},
+    waiters = [] :: [gen_server:from()]
+}).
 
 -record(state, {
     name :: atom(),
@@ -48,10 +58,19 @@
     membership_check_interval :: timeout(), %% 5 minutes
     opts = #{} :: map(), %% Options (interceptors) used to open every channel
     token = undefined :: binary() | undefined,
-    cred = undefined :: {binary(), binary()} | undefined
+    cred = undefined :: {binary(), binary()} | undefined,
+    %% The token which is being refreshed, by a process of its own, so the client does not wait
+    %% for the network.
+    refreshing = undefined :: undefined | #refresh{},
+    %% The last refresh failed: until then the requests get the same error, without asking etcd.
+    refresh_failed = undefined :: undefined | {Until :: integer(), Error :: term()}
 }).
 
 -define(TOKEN_TABLE, etcdgun_client_tokens).
+%% How long a failed refresh is the answer of the following ones, in milliseconds.
+-define(REFRESH_BACKOFF, 1000).
+%% Longer than a refresh takes: `Authenticate' waits for 5 seconds for a message of the response.
+-define(REFRESH_CALL_TIMEOUT, 15000).
 -define(RETRY_INTERVAL, 5000).
 -define(MEMBERSHIP_CHECK_INTERVAL, 300_000). % 5 minutes
 
@@ -115,16 +134,35 @@ unset_cred(Client) ->
     % eqwalizer:ignore
     gen_server:call(Client, {update_cred, undefined}).
 
+%% @doc Refresh the token, whatever the current one is. See `refresh_token/2'.
 -spec refresh_token(etcdgun:client()) ->
     {ok, NewToken :: binary()} | {error, no_credentials | auth_not_enabled | term()}.
 refresh_token(Client) ->
+    refresh_token(Client, undefined).
+
+%% @doc Refresh the token which was refused.
+%%
+%% `Stale' is the token which was refused, or `undefined' to refresh whatever the current one is.
+%% When the current token is not the refused one, someone has refreshed it already, and it is
+%% returned without authenticating again.
+%%
+%% The requests which come while a refresh is in progress wait for it and get its result, so
+%% many requests which are refused at the same time authenticate once. After a refresh failed,
+%% the requests of the next second get the same error without asking etcd.
+-spec refresh_token(etcdgun:client(), Stale :: binary() | undefined) ->
+    {ok, NewToken :: binary()} | {error, no_credentials | auth_not_enabled | term()}.
+refresh_token(Client, Stale) ->
     %% The interceptor may call this from the client process itself, e.g. when checking the members
     %% while connecting. Calling itself would crash with `calling_self'.
     case Client =:= self() orelse (is_atom(Client) andalso whereis(Client) =:= self()) of
         true -> {error, in_client_process};
         false ->
-            % eqwalizer:ignore
-            gen_server:call(Client, refresh_token)
+            try
+                % eqwalizer:ignore
+                gen_server:call(Client, {refresh_token, Stale}, ?REFRESH_CALL_TIMEOUT)
+            catch
+                exit:{timeout, _} -> {error, timeout}
+            end
     end.
 
 %% @doc The current token of the client, read from the ETS table the client writes whenever its
@@ -244,20 +282,27 @@ handle_call(client_info, _From, State) ->
     },
     {reply, {ok, Reply}, State};
 
-handle_call(refresh_token, _From, #state{cred = undefined} = State) ->
+handle_call({refresh_token, _Stale}, _From, #state{cred = undefined} = State) ->
     {reply, {error, no_credentials}, State};
 
-handle_call(refresh_token, _From, #state{cred = {Username, Password}} = State) ->
-    case auth(State#state.actives, {Username, Password}) of
-        {ok, Token} ->
-            {reply, {ok, Token}, publish_token(State#state{token = Token})};
-        {error, {etcd_error, auth_not_enabled}} ->
-            ?LOG_WARNING("Authentication is not enabled on the etcd server, unsetting token"),
-            {reply, {error, auth_not_enabled}, publish_token(State#state{token = undefined})};
-        {error, Reason} ->
-            ?LOG_ERROR("Failed to refresh token for client ~p: ~p", [State#state.name, Reason]),
-            {reply, {error, Reason}, State}
+%% Refreshed by someone else since the caller was refused.
+handle_call({refresh_token, Stale}, _From, #state{token = Token} = State)
+  when Stale =/= undefined, Token =/= undefined, Token =/= Stale ->
+    {reply, {ok, Token}, State};
+
+handle_call({refresh_token, _Stale}, From, #state{refreshing = #refresh{} = Refresh} = State) ->
+    {noreply, State#state{refreshing = Refresh#refresh{waiters = [From | Refresh#refresh.waiters]}}};
+
+handle_call({refresh_token, _Stale}, From, #state{refresh_failed = {Until, Error}} = State) ->
+    case erlang:monotonic_time(millisecond) < Until of
+        true ->
+            {reply, {error, Error}, State};
+        false ->
+            {noreply, start_refresh(From, State#state{refresh_failed = undefined})}
     end;
+
+handle_call({refresh_token, _Stale}, From, State) ->
+    {noreply, start_refresh(From, State)};
 
 handle_call(pick_channel, _From, #state{actives = []} = State) ->
     {reply, {error, no_available_connection}, State};
@@ -268,16 +313,19 @@ handle_call(pick_channel, _From, #state{actives = [{_M, Channel, _MRef} = P | Re
 
 handle_call({update_cred, undefined}, _From, #state{cred = _Cred0} = State) ->
     ?LOG_INFO("Unset credentials for client ~p", [State#state.name]),
-    {reply, ok, publish_token(State#state{cred = undefined, token = undefined})};
+    {reply, ok, publish_token(State#state{cred = undefined, token = undefined,
+                                          refresh_failed = undefined})};
 handle_call({update_cred, {Username, _Password} = Cred}, _From, #state{cred = _Cred0} = State) ->
     case auth(State#state.actives, Cred) of
         {ok, NewToken} ->
             ?LOG_INFO("Updated credentials for client ~p: ~p", [State#state.name, Username]),
-            {reply, ok, publish_token(State#state{cred = Cred, token = NewToken})};
+            {reply, ok, publish_token(State#state{cred = Cred, token = NewToken,
+                                                  refresh_failed = undefined})};
         {error, {etcd_error, auth_not_enabled}} ->
             ?LOG_WARNING("Authentication is not enabled on the etcd server, "
                          "updated credentials and unset token"),
-            {reply, ok, publish_token(State#state{cred = Cred, token = undefined})};
+            {reply, ok, publish_token(State#state{cred = Cred, token = undefined,
+                                                  refresh_failed = undefined})};
         {error, Reason} ->
             ?LOG_ERROR("Failed to update credentials for client ~p: ~p",
                       [State#state.name, Reason]),
@@ -316,6 +364,13 @@ handle_info({gun_up, GunPid, http2}, State) ->
     {noreply, handle_gun_up(GunPid, State)};
 handle_info({gun_down, GunPid, http2, Reason, _Streams}, State) ->
     {noreply, handle_gun_down(GunPid, Reason, State)};
+handle_info({refreshed, Pid, Result}, #state{refreshing = #refresh{pid = Pid} = Refresh} = State) ->
+    erlang:demonitor(Refresh#refresh.mref, [flush]),
+    {noreply, finish_refresh(Result, State)};
+handle_info({'DOWN', MRef, process, Pid, Reason},
+            #state{refreshing = #refresh{pid = Pid, mref = MRef}} = State) ->
+    ?LOG_ERROR("The refresh of the token of client ~p crashed: ~p", [State#state.name, Reason]),
+    {noreply, finish_refresh({error, {refresh_crashed, Reason}}, State)};
 handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
     erlang:demonitor(MRef, [flush]),
     {noreply, handle_gun_down(GunPid, Reason, State)};
@@ -409,6 +464,34 @@ publish_token(#state{name = Name, token = undefined} = State) ->
 publish_token(#state{name = Name, token = Token} = State) ->
     ets:insert(?TOKEN_TABLE, {Name, Token}),
     State.
+
+%% Authenticates in a process of its own, the waiters get the result from `finish_refresh/2'.
+start_refresh(From, #state{cred = Cred, actives = Actives} = State) ->
+    Self = self(),
+    {Pid, MRef} = spawn_monitor(fun() -> Self ! {refreshed, self(), auth(Actives, Cred)} end),
+    State#state{refreshing = #refresh{pid = Pid, mref = MRef, cred = Cred, waiters = [From]}}.
+
+finish_refresh(Result, #state{refreshing = #refresh{cred = Cred, waiters = Waiters}} = State0) ->
+    State = State0#state{refreshing = undefined},
+    {Reply, State1} = refresh_result(Result, Cred, State),
+    [gen_server:reply(Waiter, Reply) || Waiter <- lists:reverse(Waiters)],
+    State1.
+
+%% The credentials were changed (and the token with them) while authenticating.
+refresh_result(_Result, Cred, #state{cred = Current, token = Token} = State) when Current =/= Cred ->
+    case Token of
+        undefined -> {{error, cred_changed}, State};
+        _ -> {{ok, Token}, State}
+    end;
+refresh_result({ok, Token}, _Cred, State) when is_binary(Token) ->
+    {{ok, Token}, publish_token(State#state{token = Token, refresh_failed = undefined})};
+refresh_result({error, {etcd_error, auth_not_enabled}}, _Cred, State) ->
+    ?LOG_WARNING("Authentication is not enabled on the etcd server, unsetting token"),
+    {{error, auth_not_enabled}, publish_token(State#state{token = undefined})};
+refresh_result({error, Reason}, _Cred, State) ->
+    ?LOG_ERROR("Failed to refresh token for client ~p: ~p", [State#state.name, Reason]),
+    Until = erlang:monotonic_time(millisecond) + ?REFRESH_BACKOFF,
+    {{error, Reason}, State#state{refresh_failed = {Until, Reason}}}.
 
 ensure_close({_Id, Channel, MRef}) ->
     erlang:demonitor(MRef, [flush]),
@@ -724,6 +807,36 @@ publish_token_test() ->
         ?assertEqual({ok, <<"t2">>}, cached_token(foo)),
         publish_token(State#state{token = undefined}),
         ?assertEqual(undefined, cached_token(foo))
+    after
+        ets:delete(?TOKEN_TABLE)
+    end.
+
+finish_refresh_test() ->
+    Ref = make_ref(),
+    From = {self(), Ref},
+    Cred = {<<"root">>, <<"pw">>},
+    Refresh = #refresh{pid = self(), mref = make_ref(), cred = Cred, waiters = [From]},
+    ets:new(?TOKEN_TABLE, [set, named_table, public]),
+    try
+        State = #state{name = foo, cred = Cred, token = <<"old">>, refreshing = Refresh},
+        %% A token: published, the waiters get it
+        S1 = finish_refresh({ok, <<"new">>}, State),
+        ?assertMatch(#state{token = <<"new">>, refreshing = undefined, refresh_failed = undefined}, S1),
+        ?assertEqual({ok, <<"new">>}, cached_token(foo)),
+        receive {Ref, R1} -> ?assertEqual({ok, <<"new">>}, R1) after 0 -> ?assert(false) end,
+        %% An error: the token is kept, the error is remembered
+        S2 = finish_refresh({error, nope}, State),
+        ?assertMatch(#state{token = <<"old">>, refreshing = undefined,
+                            refresh_failed = {_, nope}}, S2),
+        receive {Ref, R2} -> ?assertEqual({error, nope}, R2) after 0 -> ?assert(false) end,
+        %% The credentials were changed meanwhile: the result is dropped, the current token is given
+        S3 = finish_refresh({ok, <<"new">>}, State#state{cred = {<<"root">>, <<"pw2">>}}),
+        ?assertMatch(#state{token = <<"old">>, refreshing = undefined}, S3),
+        receive {Ref, R3} -> ?assertEqual({ok, <<"old">>}, R3) after 0 -> ?assert(false) end,
+        S4 = finish_refresh({ok, <<"new">>},
+                            State#state{cred = undefined, token = undefined}),
+        ?assertMatch(#state{token = undefined}, S4),
+        receive {Ref, R4} -> ?assertEqual({error, cred_changed}, R4) after 0 -> ?assert(false) end
     after
         ets:delete(?TOKEN_TABLE)
     end.

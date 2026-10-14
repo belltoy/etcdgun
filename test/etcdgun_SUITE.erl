@@ -16,6 +16,9 @@
     kv_and_cluster/1,
     update_and_unset_cred/1,
     token_refresh/1,
+    token_refresh_single_flight/1,
+    token_refresh_stale/1,
+    token_refresh_failed/1,
     watch_events/1,
     watch_reconnect/1,
     watch_reconnect_before_event/1,
@@ -62,6 +65,9 @@ all() ->
         kv_and_cluster,
         update_and_unset_cred,
         token_refresh,
+        token_refresh_single_flight,
+        token_refresh_stale,
+        token_refresh_failed,
         watch_events,
         watch_reconnect,
         watch_reconnect_before_event,
@@ -260,13 +266,65 @@ update_and_unset_cred(_Config) ->
 token_refresh(_Config) ->
     {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
     {ok, Token0} = etcdgun_client:cached_token(?CLIENT),
-    ets:insert(?TOKEN_TABLE, {?CLIENT, <<"invalid.token">>}),
+    invalidate_token(Token0),
     {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
     {ok, Token1} = etcdgun_client:cached_token(?CLIENT),
     ?assertNotEqual(<<"invalid.token">>, Token1),
     ?assertNotEqual(Token0, Token1),
     %% The same channel keeps working with the new token.
     {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}).
+
+%% Many requests which are refused at once authenticate once, the others wait for the result of
+%% the refresh. Counted by tracing the calls of `Authenticate'.
+token_refresh_single_flight(_Config) ->
+    {ok, Token0} = etcdgun_client:cached_token(?CLIENT),
+    invalidate_token(Token0),
+    Self = self(),
+    Count = count_authenticates(fun() ->
+        Pids = [spawn_link(fun() ->
+                    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+                    Self ! {self(), etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})}
+                end) || _ <- lists:seq(1, 50)],
+        [?assertMatch({ok, _}, receive {Pid, R} -> R after 30000 -> timeout end) || Pid <- Pids]
+    end),
+    ?assertEqual(1, Count),
+    {ok, Token1} = etcdgun_client:cached_token(?CLIENT),
+    ?assertNotEqual(Token0, Token1).
+
+%% A caller which was refused with a token which is not the current one does not authenticate.
+token_refresh_stale(_Config) ->
+    {ok, Token} = etcdgun_client:cached_token(?CLIENT),
+    Count = count_authenticates(fun() ->
+        ?assertEqual({ok, Token}, etcdgun_client:refresh_token(?CLIENT, <<"old.token">>))
+    end),
+    ?assertEqual(0, Count),
+    %% The current token, or none, is refreshed.
+    ?assertEqual(1, count_authenticates(fun() ->
+        {ok, _} = etcdgun_client:refresh_token(?CLIENT, Token)
+    end)),
+    ?assertEqual(1, count_authenticates(fun() ->
+        {ok, _} = etcdgun_client:refresh_token(?CLIENT)
+    end)).
+
+%% The refresh which failed is the answer of the next second, then etcd is asked again.
+token_refresh_failed(_Config) ->
+    %% The password of the client is not the one of etcd anymore (the state is replaced, the
+    %% client keeps it as it was given).
+    sys:replace_state(whereis(?CLIENT), fun(State) ->
+        list_to_tuple([case E of {<<"root">>, _} -> {<<"root">>, <<"nope">>}; _ -> E end
+                       || E <- tuple_to_list(State)])
+    end),
+    Count = count_authenticates(fun() ->
+        {error, Error} = etcdgun_client:refresh_token(?CLIENT),
+        ?assertEqual({error, Error}, etcdgun_client:refresh_token(?CLIENT)),
+        %% Refused with a token which is not the current one: nothing to refresh
+        ?assertMatch({ok, _}, etcdgun_client:refresh_token(?CLIENT, <<"x">>))
+    end),
+    ?assertEqual(1, Count),
+    timer:sleep(1100),
+    ?assertEqual(1, count_authenticates(fun() ->
+        ?assertMatch({error, _}, etcdgun_client:refresh_token(?CLIENT))
+    end)).
 
 watch_events(_Config) ->
     Prefix = key(),
@@ -986,6 +1044,35 @@ open_without_cred(Opts) ->
     Res = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts#{membership_check_interval => infinity}),
     _ = etcdgun:close(?CLIENT),
     Res.
+
+%% The token is not valid anymore, as it is not after a restart of the cluster: the client and
+%% what the callers read have it.
+invalidate_token(Token) ->
+    sys:replace_state(whereis(?CLIENT), fun(State) ->
+        list_to_tuple([case E of Token -> <<"invalid.token">>; _ -> E end
+                       || E <- tuple_to_list(State)])
+    end),
+    ets:insert(?TOKEN_TABLE, {?CLIENT, <<"invalid.token">>}).
+
+%% How many times `Authenticate' was called while Fun ran.
+count_authenticates(Fun) ->
+    Self = self(),
+    Tracer = spawn_link(fun() -> count_loop(0) end),
+    MFA = {etcdgun_etcdserverpb_auth_client, authenticate, 2},
+    _ = erlang:trace_pattern(MFA, true, [global]),
+    _ = erlang:trace(all, true, [call, {tracer, Tracer}]),
+    try Fun() after
+        _ = erlang:trace(all, false, [call]),
+        _ = erlang:trace_pattern(MFA, false, [global])
+    end,
+    Tracer ! {done, Self},
+    receive {count, N} -> N after 5000 -> error(no_count) end.
+
+count_loop(N) ->
+    receive
+        {trace, _, call, _} -> count_loop(N + 1);
+        {done, To} -> To ! {count, N}
+    end.
 
 key() ->
     iolist_to_binary(["/etcdgun_ct/", integer_to_binary(erlang:unique_integer([positive]))]).

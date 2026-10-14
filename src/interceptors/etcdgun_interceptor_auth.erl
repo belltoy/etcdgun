@@ -67,6 +67,9 @@ get_token(Stream) ->
 refresh_token(Stream, Req, Opts, Next) ->
     ?LOG_DEBUG("Refresh token interceptor for RPC ~s.~s",
               [egrpc_stream:grpc_service(Stream), egrpc_stream:grpc_method(Stream)]),
+    %% The token the request is sent with, before it is: when it is refused and the current one is
+    %% not it anymore, the token was refreshed by someone else, and there is nothing to refresh.
+    Stale = stale_token(Stream),
     Res = case Next(Stream, Req, Opts) of
               {ok, _} = Ok -> Ok;
               {error, {grpc_error, _, _} = GrpcError} ->
@@ -78,7 +81,7 @@ refresh_token(Stream, Req, Opts, Next) ->
         {error, {etcd_error, Reason}} when Reason =:= user_empty;
                                            Reason =:= auth_old_revision;
                                            Reason =:= invalid_auth_token ->
-            case refresh_token(Stream) of
+            case refresh_token(Stream, Stale) of
                 {ok, NewToken} ->
                     %% Use the same stream (not http2 stream) to retry sending the request with
                     %% the new token
@@ -92,10 +95,20 @@ refresh_token(Stream, Req, Opts, Next) ->
         Other -> Other
     end.
 
-refresh_token(Stream) ->
+stale_token(Stream) ->
+    case egrpc_stub:info(egrpc_stream:channel(Stream)) of
+        #{client := Client} when is_atom(Client) ->
+            case etcdgun_client:cached_token(Client) of
+                {ok, Token} -> Token;
+                undefined -> undefined
+            end;
+        _ -> undefined
+    end.
+
+refresh_token(Stream, Stale) ->
     Channel = egrpc_stream:channel(Stream),
     case egrpc_stub:info(Channel) of
-        #{client := Client} when is_atom(Client) -> etcdgun_client:refresh_token(Client);
+        #{client := Client} when is_atom(Client) -> etcdgun_client:refresh_token(Client, Stale);
         _ -> {error, not_a_client}
     end.
 
