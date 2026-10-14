@@ -18,6 +18,7 @@
     token_refresh/1,
     watch_events/1,
     watch_reconnect/1,
+    watch_reconnect_before_event/1,
     lease_keepalive/1,
     membership_sync/1,
     member_down/1,
@@ -53,6 +54,7 @@ all() ->
         token_refresh,
         watch_events,
         watch_reconnect,
+        watch_reconnect_before_event,
         lease_keepalive,
         membership_sync,
         member_down,
@@ -256,8 +258,8 @@ watch_events(_Config) ->
     ?assertMatch([#{kv := #{key := Key, value := <<"2">>}}], recv_events()),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
-%% The watcher is restarted when its connection is down, and resumes from the last revision, so
-%% the event which happened while it was down is not lost.
+%% The watcher stays when its connection is down (it is the same process), and resumes from the
+%% last revision, so the event which happened while it was down is not lost.
 watch_reconnect(_Config) ->
     Prefix = key(),
     {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
@@ -269,6 +271,20 @@ watch_reconnect(_Config) ->
     exit(ConnPid, kill),
     put_retry(B, <<"2">>),
     ?assertMatch([#{kv := #{key := B}}], recv_events(15000)),
+    ?assertEqual(Pid, whereis(ct_watcher)),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% No event was received before the connection is lost: the watch is resumed from where it was
+%% created, not from the time of the new connection, or the event of the meantime would be lost.
+watch_reconnect_before_event(_Config) ->
+    Prefix = key(),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
+    A = <<Prefix/binary, "/a">>,
+    {monitors, [{process, ConnPid}]} = process_info(Pid, monitors),
+    exit(ConnPid, kill),
+    put_retry(A, <<"1">>),
+    ?assertMatch([#{kv := #{key := A}}], recv_events(15000)),
+    ?assertEqual(Pid, whereis(ct_watcher)),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
 lease_keepalive(_Config) ->
@@ -428,6 +444,7 @@ watch_replay_from_start(_Config) ->
     exit(ConnPid, kill),
     Rest = recv_keys(length(Keys) - length(First), 30000),
     ?assertEqual(Keys, First ++ Rest),
+    ?assertEqual(Pid, whereis(ct_watcher)),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
 %% A lease which does not exist: the start is refused with the reason, not with a

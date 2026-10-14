@@ -11,7 +11,6 @@
 -record(watcher_event_manager, {id , event_manager_pid}).
 
 start_link() ->
-    etcdgun_watcher:create_watch_cache_table(),
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Request) ->
@@ -73,9 +72,6 @@ stop_child(Client, WatcherName) ->
     case supervisor:terminate_child(?MODULE, {Client, WatcherName}) of
         ok ->
             ok = supervisor:delete_child(?MODULE, {Client, WatcherName}),
-            %% The revisions of a watcher which was cancelled are not for a new one of the name,
-            %% which would start from them instead of from what its requests say.
-            etcdgun_watcher:delete_last_revisions(WatcherName),
             case ets:lookup(?WATCHER_EVENT_MANAGER, {Client, WatcherName}) of
                 [#watcher_event_manager{event_manager_pid = EventMgr} = Record] ->
                     ets:delete_object(?WATCHER_EVENT_MANAGER, Record),

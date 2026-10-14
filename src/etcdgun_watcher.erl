@@ -8,8 +8,6 @@
 -include_lib("kernel/include/logger.hrl").
 
 -export([
-    create_watch_cache_table/0,
-    delete_last_revisions/1,
     start_link/4
 ]).
 
@@ -37,6 +35,9 @@
     create_ref = undefined :: undefined | reference(),
     %% The response of the creation is not received yet.
     creating = false :: boolean(),
+    %% The revision of the last response which was handled, the watch resumes after it when the
+    %% connection is lost. `undefined' until the watch is created.
+    last_revision = undefined :: undefined | integer(),
     buf = <<>> :: binary()
 }).
 
@@ -44,33 +45,11 @@
 -define(WATCH_EVENT_CANCELED, watch_canceled).
 -define(WATCH_EVENT_STOPPED(Reason), {watch_stopped, Reason}).
 
--define(WATCH_CACHE_TABLE, etcdgun_watcher_cache).
 -define(CONNECT_RETRY_INTERVAL, 1000).
 %% A watcher has one watch, with this id.
 -define(WATCH_ID, 1).
 
--record(watcher_cache, {
-    watcher_name :: atom(),
-    last_revisions :: #{WatchId :: integer() => Revision :: integer()}
-}).
-
 %% TODO: Timeout, invalid auth token, reconnect, etc.
-
-%% @doc Forget the last revisions of the watcher.
--spec delete_last_revisions(atom()) -> ok.
-delete_last_revisions(WatcherName) ->
-    true = ets:delete(?WATCH_CACHE_TABLE, WatcherName),
-    ok.
-
-create_watch_cache_table() ->
-    case ets:info(?WATCH_CACHE_TABLE) of
-        undefined ->
-            ets:new(?WATCH_CACHE_TABLE,
-                [set, named_table, public,
-                 {keypos, #watcher_cache.watcher_name},
-                 {read_concurrency, true}]);
-        _Info -> ok
-    end.
 
 start_link(Client, WatcherName, EventMgr, Request) ->
     Args = {Client, WatcherName, EventMgr, Request},
@@ -107,12 +86,12 @@ try_connect(State) ->
     end.
 
 %% Open the watch stream and send the create request.
-connect(#state{client = Client, watcher_name = WatcherName, request = Request} = State) ->
+connect(#state{client = Client} = State) ->
     maybe
         {ok, Channel} ?= pick_channel(Client),
         {ok, Stream} ?= etcdgun_etcdserverpb_watch_client:watch(Channel),
-        %% Load the last revision if the watcher is being restarted.
-        Request1 = load_last_revision(WatcherName, Request),
+        %% After a lost connection the watch resumes after the last revision which was handled.
+        Request1 = resume_request(State),
         case create_watch(Stream, Request1) of
             {ok, Stream1} ->
                 %% Monitor the gun connection pid.
@@ -164,25 +143,35 @@ handle_info({timeout, TRef, create_watch_timeout},
     {noreply, State#state{create_ref = undefined}};
 handle_info({timeout, TRef, create_watch_timeout},
             #state{create_ref = TRef} = State) ->
-    {stop, {create_error, timeout}, State#state{create_ref = undefined}};
+    pause({create_error, timeout}, State#state{create_ref = undefined});
 
 handle_info({gun_data, _ConnPid, StreamRef, nofin, Data},
             #state{stream_ref = StreamRef, buf = Buf} = State) ->
     {noreply, State#state{buf = <<Buf/binary, Data/binary>>}, {continue, process_data}};
 handle_info({gun_data, _ConnPid, StreamRef, fin, _Data}, #state{stream_ref = StreamRef} = State) ->
-    {stop, {grpc_error, eos}, State};
+    pause({grpc_error, eos}, State);
 handle_info({gun_trailers, _ConnPid, StreamRef, _Trailers},
             #state{stream_ref = StreamRef} = State) ->
-    {stop, {grpc_error, eos}, State};
+    pause({grpc_error, eos}, State);
 handle_info({gun_error, _ConnPid, StreamRef, Reason},
             #state{stream_ref = StreamRef} = State) ->
-    {stop, {stream_error, Reason}, State};
+    pause({stream_error, Reason}, State);
 handle_info({gun_error, ConnPid, Reason}, #state{conn_pid = ConnPid} = State) ->
-    {stop, {connection_error, Reason}, State};
+    pause({connection_error, Reason}, State);
 
 handle_info({'DOWN', MRef, process, ConnPid, Reason}, #state{monitor_ref = MRef} = State) ->
     ?LOG_WARNING("Connection ~p down: ~p", [ConnPid, Reason]),
-    {stop, {down, Reason}, State};
+    pause({down, Reason}, State);
+
+%% The messages of a stream or a connection which was left are of no interest.
+handle_info({timeout, _TRef, create_watch_timeout}, State) ->
+    {noreply, State};
+handle_info(Info, State) when is_tuple(Info), element(1, Info) =:= gun_data;
+                              is_tuple(Info), element(1, Info) =:= gun_trailers;
+                              is_tuple(Info), element(1, Info) =:= gun_error;
+                              is_tuple(Info), element(1, Info) =:= gun_response;
+                              is_tuple(Info), element(1, Info) =:= gun_inform ->
+    {noreply, State};
 
 handle_info({'EXIT', Pid, Reason}, State) ->
     ?LOG_WARNING("Got exit message from ~p: ~p", [Pid, Reason]),
@@ -200,7 +189,7 @@ handle_continue(process_data, State) ->
 process_data(#state{buf = Buf, stream = Stream} = State, ParseMsg) ->
     case ParseMsg(Stream, Buf) of
         more -> {noreply, State};
-        {error, Reason} -> {stop, {grpc_error, Reason}, State};
+        {error, Reason} -> pause({grpc_error, Reason}, State);
         {ok, Stream1, Msg, Rest} ->
             process_response(Msg, update_stream(Stream1, State#state{buf = Rest}))
     end.
@@ -220,6 +209,23 @@ terminate(Reason, State) ->
 %% Private functions
 %%-------------------------------------------------------------------
 
+%% The connection or the stream is lost, or the server refused the token. The watcher stays, with
+%% what the handler knows, and connects again, it resumes after the last revision which was
+%% handled, so that no event is lost.
+pause(Reason, #state{watcher_name = WatcherName} = State) ->
+    ?LOG_WARNING("Watcher ~p is paused: ~p, connect again", [WatcherName, Reason]),
+    State1 = disconnect(State),
+    TRef = erlang:start_timer(?CONNECT_RETRY_INTERVAL, self(), connect),
+    {noreply, State1#state{connect_ref = TRef}}.
+
+%% Forget the stream and the connection of it, whatever arrives for them later is ignored.
+disconnect(#state{monitor_ref = MRef, create_ref = CreateRef} = State) ->
+    cancel_stream(State),
+    is_reference(MRef) andalso erlang:demonitor(MRef, [flush]),
+    is_reference(CreateRef) andalso erlang:cancel_timer(CreateRef),
+    State#state{stream = undefined, stream_ref = undefined, monitor_ref = undefined,
+                conn_pid = undefined, create_ref = undefined, creating = false, buf = <<>>}.
+
 is_normal(normal) -> true;
 is_normal(shutdown) -> true;
 is_normal({shutdown, _}) -> true;
@@ -230,21 +236,22 @@ process_response(#{created := true,
                    watch_id := ?WATCH_ID, header := #{revision := Rev}},
                  #state{creating = true} = State) ->
     ?LOG_INFO("Watcher ~p created the watch, revision ~p", [State#state.watcher_name, Rev]),
-    {noreply, State#state{creating = false}, {continue, process_data}};
+    {noreply, State#state{creating = false, last_revision = created_revision(Rev, State)},
+     {continue, process_data}};
 process_response(#{created := true} = Response, State) ->
     ?LOG_WARNING("Watcher ~p received unexpected create response: ~p",
                  [State#state.watcher_name, Response]),
     {noreply, State, {continue, process_data}};
 process_response(#{canceled := true} = Response, State) ->
     canceled(Response, State);
-process_response(#{created := false, canceled := false, watch_id := WatchId} = Response, State) ->
+%% A progress notification which is for all the watches of the stream has no id of the watch.
+process_response(#{created := false, canceled := false} = Response, State) ->
     %% A progress notification has no events, there is nothing to tell the handler.
     case maps:get(events, Response, []) of
         [] -> ok;
         Events -> notify(?WATCH_EVENT_EVENTS(Events), State)
     end,
-    update_last_revision(State#state.watcher_name, WatchId, last_revision(Response)),
-    {noreply, State, {continue, process_data}};
+    {noreply, State#state{last_revision = last_revision(Response)}, {continue, process_data}};
 process_response(Response, State) ->
     %% Whatever else, e.g. a response of a watch which was not created, must not stall the
     %% messages which are in the buffer.
@@ -254,8 +261,8 @@ process_response(Response, State) ->
 
 %% The server cancels a watch, when it was cancelled by the request, or when it is not allowed:
 %% the token is not valid, e.g. after a restart of the members, for a streaming request there is
-%% no interceptor which refreshes it. Refresh it and stop, the supervisor restarts the watcher,
-%% which creates the watches again with the new token.
+%% no interceptor which refreshes it. Refresh it and connect again, which creates the watch with
+%% the new token.
 canceled(#{cancel_reason := Reason} = Response, #state{client = Client} = State)
   when is_binary(Reason), Reason =/= <<>> ->
     case is_auth_error(Reason) of
@@ -263,7 +270,7 @@ canceled(#{cancel_reason := Reason} = Response, #state{client = Client} = State)
             ?LOG_WARNING("Watcher ~p was refused: ~s, refresh the token and restart",
                          [State#state.watcher_name, Reason]),
             _ = refresh_token(Client),
-            {stop, {watch_error, invalid_auth_token}, State};
+            pause({watch_error, invalid_auth_token}, State);
         false ->
             canceled_by_request(Response, State)
     end;
@@ -310,27 +317,24 @@ cancel_stream(#state{}) ->
 update_stream(Stream, #state{} = State) ->
     State#state{stream = Stream}.
 
-% If the watcher was previously registered, we can start from the last revision.
-% This is useful for resuming watches after a disconnect.
-load_last_revision(WatcherName, Request) ->
-    case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
-        [#watcher_cache{last_revisions = #{?WATCH_ID := LastRevision}}] ->
-            Request#{start_revision => LastRevision + 1};
-        _ ->
-            Request
-    end.
+%% The request to create the watch with: the watch resumes after the last revision which was
+%% handled, when there is one.
+resume_request(#state{request = Request, last_revision = undefined}) ->
+    Request;
+resume_request(#state{request = Request, last_revision = LastRevision}) ->
+    Request#{start_revision => LastRevision + 1}.
 
-update_last_revision(WatcherName, WatchId, LastRev) ->
-    case ets:lookup(?WATCH_CACHE_TABLE, WatcherName) of
-        [] ->
-            Cache = #watcher_cache{watcher_name = WatcherName,
-                                   last_revisions = #{WatchId => LastRev}},
-            ets:insert(?WATCH_CACHE_TABLE, Cache);
-        [#watcher_cache{last_revisions = LastRevisions} = Cache] ->
-            NewLastRevisions = LastRevisions#{WatchId => LastRev},
-            ets:insert(?WATCH_CACHE_TABLE, Cache#watcher_cache{last_revisions = NewLastRevisions})
-    end,
-    ok.
+%% The last revision of a watch which was just created, as no response was handled yet. The
+%% header of the response is the current revision of the store, which is where the watch starts,
+%% unless the request says to start at an older (or newer) revision: the events from it on are to
+%% come, so that the one before it is the last handled.
+created_revision(_HeaderRevision, #state{last_revision = LastRevision}) when LastRevision =/= undefined ->
+    LastRevision;
+created_revision(HeaderRevision, #state{request = Request}) ->
+    case maps:get(start_revision, Request, 0) of
+        StartRevision when is_integer(StartRevision), StartRevision > 0 -> StartRevision - 1;
+        _ -> HeaderRevision
+    end.
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -382,4 +386,24 @@ last_revision_test() ->
     %% a progress notification: everything up to the header was sent
     ?assertEqual(100, last_revision(#{header => #{revision => 100}, events => []})),
     ?assertEqual(100, last_revision(#{header => #{revision => 100}})).
+
+resume_request_test() ->
+    State = #state{request = #{key => <<"k">>, start_revision => 5}},
+    %% nothing was handled: what the request says
+    ?assertEqual(#{key => <<"k">>, start_revision => 5},
+                 resume_request(State#state{last_revision = undefined})),
+    %% after the last revision which was handled
+    ?assertEqual(#{key => <<"k">>, start_revision => 21},
+                 resume_request(State#state{last_revision = 20})).
+
+created_revision_test() ->
+    State = #state{request = #{key => <<"k">>}},
+    %% a watch from now: the event after the header is the first one
+    ?assertEqual(100, created_revision(100, State)),
+    %% a watch from a revision: the one before it, not the current revision of the store, or the
+    %% events from it to the current one would be skipped after a reconnection
+    ?assertEqual(49, created_revision(100, State#state{request = #{start_revision => 50}})),
+    ?assertEqual(100, created_revision(100, State#state{request = #{start_revision => 0}})),
+    %% created again after a lost connection: what was handled stays
+    ?assertEqual(70, created_revision(100, State#state{last_revision = 70})).
 -endif.
