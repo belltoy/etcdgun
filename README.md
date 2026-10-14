@@ -145,6 +145,13 @@ return, or an exception, is a crash of the handler: it is initialised again with
 its state and the events it was given are lost (they are given at most once), and the watcher
 stops with `{handler_failed, Reason}` when it happens more than 5 times in 10 seconds.
 
+What a handler does with the events is its own matter: when it crashes the watcher can not know
+how much of them it had done, so it does not give them again, and a crash is not a way to try
+again. A handler which can not lose an event catches its errors in `handle_event/2` and decides
+(try again, keep the event, or return `{cancel_watch, State}`). A crash is seen in the log, in the
+`terminate({error, Reason}, State)` of the handler which is called first, and in its `init/1`
+which is called again.
+
 The watcher does not give up when the network or the cluster is not available, it tries again
 every second. It stops, and is not restarted, when it is not going to change by trying again.
 Monitor the pid to know, the reason of the exit is:

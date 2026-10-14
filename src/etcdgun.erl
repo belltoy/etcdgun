@@ -97,6 +97,13 @@ close(Client) ->
 %%       state is lost, and so is the event, which is given at most once), and the watcher stops
 %%       with `{handler_failed, Reason}' when that happens more than 5 times in 10 seconds.</li>
 %% </ul>
+%% What a handler does with the events is its own matter. When it crashes the watcher can not know
+%% how much of them it had done, so it does not give them again, and a crash is not a way to try
+%% again. A handler which can not lose an event catches its errors in `handle_event/2' and decides
+%% (try again, keep the event, or return `{cancel_watch, State}'). A crash is seen in the log, in
+%% `terminate({error, Reason}, State)' of the handler, which is called first, and in `init/1',
+%% which is called again.
+%%
 %% The events are:
 %% <ul>
 %%   <li>`{watch_events, Events}';</li>
