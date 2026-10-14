@@ -5,7 +5,7 @@
 
 -export([start_link/0, init/1]).
 
--export([start_child/5, stop_child/2]).
+-export([start_child/5, stop_child/2, stop_children/1]).
 
 start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
@@ -34,7 +34,9 @@ do_start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Request) ->
     Child = #{
         id => {Client, WatcherName},
         start => {etcdgun_watcher, start_link, Args},
-        restart => transient,
+        %% A watcher which stopped is not started again, there is no state left for it to resume
+        %% from: whoever watches decides, with the reason of the exit.
+        restart => temporary,
         shutdown => 1000,
         type => worker,
         modules => [etcdgun_watcher]
@@ -49,13 +51,21 @@ do_start_child(Client, WatcherName, EventHandler, EventHandlerArgs, Request) ->
 
 -spec stop_child(atom(), atom()) -> ok | {error, not_found}.
 stop_child(Client, WatcherName) ->
-    case supervisor:terminate_child(?MODULE, {Client, WatcherName}) of
-        ok ->
-            ok = supervisor:delete_child(?MODULE, {Client, WatcherName}),
-            ok;
-        {error, not_found} = E -> E
-    end.
+    %% The child is temporary, its spec is gone with it.
+    supervisor:terminate_child(?MODULE, {Client, WatcherName}).
 
+%% @doc Stop the watchers of a client, they have nothing to watch with when it is closed.
+-spec stop_children(atom()) -> ok.
+stop_children(Client) ->
+    try supervisor:which_children(?MODULE) of
+        Children ->
+            [_ = supervisor:terminate_child(?MODULE, Id)
+             || {{C, _Name} = Id, _Pid, _Type, _Modules} <- Children, C =:= Client],
+            ok
+    catch
+        %% there is no supervisor, there is no watcher
+        exit:_ -> ok
+    end.
 init([]) ->
     MaxRestarts = 300,
     MaxSecondsBetweenRestarts = 10,

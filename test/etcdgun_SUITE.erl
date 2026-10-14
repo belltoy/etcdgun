@@ -27,6 +27,7 @@
     watch_stopped_revision/1,
     watch_compacted/1,
     watch_auth_failed/1,
+    watcher_exit_reasons/1,
     lease_keepalive/1,
     membership_sync/1,
     member_down/1,
@@ -71,6 +72,7 @@ all() ->
         watch_stopped_revision,
         watch_compacted,
         watch_auth_failed,
+        watcher_exit_reasons,
         lease_keepalive,
         membership_sync,
         member_down,
@@ -434,6 +436,95 @@ watch_auth_failed(_Config) ->
     end,
     _ = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
+%% How a watcher ends, what the handler is told, and what the one who watches sees (`DOWN'). The
+%% handler is told by `terminate/2' of the watcher, which is not called when it is killed.
+watcher_exit_reasons(_Config) ->
+    Start = fun(Args) ->
+        {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, Args, watch_req(key())),
+        wait_handler_init(),
+        {Pid, erlang:monitor(process, Pid)}
+    end,
+    Down = fun(Pid, MRef) ->
+        receive
+            {'DOWN', MRef, process, Pid, Reason} -> Reason
+        after 10000 ->
+            ct:fail(no_down)
+        end
+    end,
+    Told = fun(Reason) ->
+        receive {watch_event, {watch_stopped, Reason, _}} -> ok after 1000 -> ct:fail(no_watch_stopped) end,
+        receive {handler_terminate, Reason} -> ok after 1000 -> ct:fail(no_terminate) end
+    end,
+    NotTold = fun() ->
+        receive
+            {watch_event, {watch_stopped, _, _}} -> ct:fail(watch_stopped);
+            {handler_terminate, _} -> ct:fail(terminate)
+        after 500 -> ok
+        end
+    end,
+    %% the handler was told, and its `terminate' did not end in time
+    NotTerminated = fun(Reason) ->
+        receive {watch_event, {watch_stopped, Reason, _}} -> ok after 1000 -> ct:fail(no_watch_stopped) end,
+        receive {handler_terminate, _} -> ct:fail(terminate) after 500 -> ok end
+    end,
+    %% cancelled
+    {P1, M1} = Start(self()),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher),
+    ?assertEqual(shutdown, Down(P1, M1)),
+    Told(shutdown),
+    %% another process ends it: the handler is told with the reason
+    {P2, M2} = Start(self()),
+    exit(P2, some_reason),
+    ?assertEqual(some_reason, Down(P2, M2)),
+    Told(some_reason),
+    %% a normal exit of a process which is linked is not the end of the watch
+    {P3, M3} = Start(self()),
+    exit(P3, normal),
+    timer:sleep(300),
+    ?assert(is_process_alive(P3)),
+    erlang:demonitor(M3, [flush]),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher),
+    Told(shutdown),
+    %% killed: nothing is called, but the name is free for a new watcher (it is not restarted)
+    {P4, M4} = Start(self()),
+    exit(P4, kill),
+    ?assertEqual(killed, Down(P4, M4)),
+    NotTold(),
+    ?assertEqual(undefined, whereis(ct_watcher)),
+    {P5, M5} = Start(self()),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher),
+    ?assertEqual(shutdown, Down(P5, M5)),
+    Told(shutdown),
+    %% a `terminate' of the handler which does not end in time: the watcher is killed
+    {P6, M6} = Start({slow_terminate, self()}),
+    {Time, ok} = timer:tc(fun() -> etcdgun:cancel_watch(?CLIENT, ct_watcher) end),
+    ?assertEqual(killed, Down(P6, M6)),
+    ?assert(Time >= 1000000),
+    NotTerminated(shutdown),
+    %% the supervisor of the watchers is shut down, as when the application stops
+    {P7, M7} = Start(self()),
+    ok = supervisor:terminate_child(etcdgun_sup, etcdgun_watcher_sup),
+    ?assertEqual(shutdown, Down(P7, M7)),
+    Told(shutdown),
+    {ok, _} = supervisor:restart_child(etcdgun_sup, etcdgun_watcher_sup),
+    %% the supervisor of the watchers is killed
+    {P8, M8} = Start(self()),
+    Sup = whereis(etcdgun_watcher_sup),
+    exit(Sup, kill),
+    ?assertEqual(killed, Down(P8, M8)),
+    Told(killed),
+    ok = wait_until(fun() ->
+        case whereis(etcdgun_watcher_sup) of
+            Pid when is_pid(Pid), Pid =/= Sup -> true;
+            _ -> false
+        end
+    end, 20),
+    %% the client is closed
+    {P9, M9} = Start(self()),
+    ok = etcdgun:close(?CLIENT),
+    ?assertEqual(shutdown, Down(P9, M9)),
+    Told(shutdown).
+
 lease_keepalive(_Config) ->
     {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
     {ok, #{'ID' := LeaseId}} =
@@ -474,9 +565,15 @@ member_down(_Config) ->
     {0, _} = sh(["docker stop -t 1 ", Container]),
     try
         ok = wait_until(fun() -> actives() =:= 2 end),
-        %% The requests are served by the other members.
-        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})
+        %% The requests are served by the other members, when the member which was stopped was the
+        %% leader the first ones may be refused while another one is elected.
+        ok = wait_until(fun() ->
+            {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+            case etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}) of
+                {ok, _} -> true;
+                {error, _} -> false
+            end
+        end, 20)
     after
         {0, _} = sh(["docker start ", Container])
     end,

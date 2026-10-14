@@ -73,7 +73,9 @@ open(Client, Endpoints) ->
 open(Client, Endpoints, Opts) ->
     etcdgun_client_sup:start_child(Client, Endpoints, Opts).
 
+%% @doc Close the client, the watchers of it are stopped with the reason `shutdown'.
 close(Client) ->
+    ok = etcdgun_watcher_sup:stop_children(Client),
     etcdgun_client_sup:stop_child(Client).
 
 %% @doc Start a watcher, which has one watch, with the create request `Request' (a

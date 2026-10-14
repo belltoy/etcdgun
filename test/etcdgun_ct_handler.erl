@@ -10,6 +10,9 @@
 
 init(fail) ->
     {error, init_failed};
+init({slow_terminate, Pid}) ->
+    put(slow_terminate, true),
+    init(Pid);
 init(Pid) ->
     Pid ! handler_init,
     {ok, Pid}.
@@ -34,5 +37,6 @@ send(Event, Pid) ->
 handle_call(_Request, Pid) -> {ok, ok, Pid}.
 
 terminate(Reason, Pid) ->
+    get(slow_terminate) =:= true andalso timer:sleep(5000),
     Pid ! {handler_terminate, Reason},
     ok.

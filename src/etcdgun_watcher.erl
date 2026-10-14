@@ -209,6 +209,11 @@ handle_info(Info, State) when is_tuple(Info), element(1, Info) =:= gun_data;
                               is_tuple(Info), element(1, Info) =:= gun_inform ->
     {noreply, State};
 
+%% Something which is linked ended normally, which is not a reason to stop the watch.
+handle_info({'EXIT', Pid, normal}, State) ->
+    ?LOG_DEBUG("Watcher ~p: ~p exited normally", [State#state.watcher_name, Pid]),
+    {noreply, State};
+
 handle_info({'EXIT', Pid, Reason}, State) ->
     ?LOG_WARNING("Got exit message from ~p: ~p", [Pid, Reason]),
     {stop, Reason, State};
