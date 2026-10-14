@@ -100,7 +100,11 @@ close(Client) ->
 %%   <li>`{watch_paused, Reason, LastRevision}', once, when the connection is lost (or can not be
 %%       made): the watcher stays, connects again and resumes after the last revision, no event
 %%       is lost;</li>
-%%   <li>`{watch_resumed, LastRevision}', when the watch is created again;</li>
+%%   <li>`{watch_resumed, LastRevision}', when the watch is created again. This is also the case
+%%       when the connection could not be made at the start: `watch/5' returns `{ok, Pid}', the
+%%       handler is told `{watch_paused, Reason, undefined}' (the watch was not created, there is
+%%       no revision), and `{watch_resumed, LastRevision}' when it is created. A watch which is
+%%       created at the first attempt gets neither;</li>
 %%   <li>`{watch_stopped, Reason, LastRevision}', when the watcher stops, as far as it is able
 %%       to: it is not when it is killed.</li>
 %% </ul>
