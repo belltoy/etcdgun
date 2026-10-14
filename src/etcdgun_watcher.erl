@@ -47,18 +47,26 @@
     %% The revision of the last response which was handled, the watch resumes after it when the
     %% connection is lost. `undefined' until the watch is created.
     last_revision = undefined :: undefined | integer(),
+    %% The handler was told that the watch is paused, and is not told again until it is resumed.
+    paused = false :: boolean(),
+    %% The consecutive refusals of the token, the watcher gives up when it keeps being refused.
+    auth_failures = 0 :: non_neg_integer(),
     buf = <<>> :: binary()
 }).
 
 -define(WATCH_EVENT_EVENTS(Events), {watch_events, Events}).
--define(WATCH_EVENT_CANCELED, watch_canceled).
--define(WATCH_EVENT_STOPPED(Reason), {watch_stopped, Reason}).
+-define(WATCH_EVENT_PAUSED(Reason, LastRevision), {watch_paused, Reason, LastRevision}).
+-define(WATCH_EVENT_RESUMED(LastRevision), {watch_resumed, LastRevision}).
+-define(WATCH_EVENT_STOPPED(Reason, LastRevision), {watch_stopped, Reason, LastRevision}).
 
 -define(CONNECT_RETRY_INTERVAL, 1000).
 %% A handler which crashes more than this often in the period is given up, or a handler which
 %% crashes at every event would be initialised again and again.
 -define(HANDLER_MAX_CRASHES, 5).
 -define(HANDLER_CRASH_PERIOD, 10000).
+%% A token which is refused this many times in a row, although it was refreshed, is not going to
+%% be accepted: the credentials were changed or removed.
+-define(MAX_AUTH_FAILURES, 3).
 %% A watcher has one watch, with this id.
 -define(WATCH_ID, 1).
 
@@ -92,20 +100,25 @@ init({Client, WatcherName, Handler, HandlerArgs, Request}) ->
             %% fails the watcher stays and retries, as a failed start would be restarted at once by
             %% the supervisor, again and again, which is why it slept here before (blocking the
             %% supervisor).
-            {ok, try_connect(State)};
+            case try_connect(State) of
+                {noreply, State1} -> {ok, State1};
+                {stop, Reason, State1} ->
+                    %% terminate/2 is not called when init/1 does not return a state.
+                    ok = stop_handler(Reason, State1),
+                    {stop, Reason}
+            end;
         {error, Reason} ->
             {stop, {handler_init, Reason}}
     end.
 
+%% Connect and create the watch, when it fails the watcher is paused, or it stops when the reason
+%% is not going to go away.
 try_connect(State) ->
     case connect(State) of
         {ok, State1} ->
-            State1;
+            {noreply, State1};
         {error, Reason} ->
-            ?LOG_WARNING("Watcher ~p failed to connect: ~p, retry",
-                         [State#state.watcher_name, Reason]),
-            TRef = erlang:start_timer(?CONNECT_RETRY_INTERVAL, self(), connect),
-            State#state{connect_ref = TRef}
+            on_error(Reason, State)
     end.
 
 %% Open the watch stream and send the create request.
@@ -159,7 +172,7 @@ handle_cast(_Msg, State) ->
     {noreply, State}.
 
 handle_info({timeout, TRef, connect}, #state{connect_ref = TRef} = State) ->
-    {noreply, try_connect(State#state{connect_ref = undefined})};
+    try_connect(State#state{connect_ref = undefined});
 
 handle_info({timeout, TRef, create_watch_timeout},
             #state{create_ref = TRef, creating = false} = State) ->
@@ -173,9 +186,9 @@ handle_info({gun_data, _ConnPid, StreamRef, nofin, Data},
     {noreply, State#state{buf = <<Buf/binary, Data/binary>>}, {continue, process_data}};
 handle_info({gun_data, _ConnPid, StreamRef, fin, _Data}, #state{stream_ref = StreamRef} = State) ->
     pause({grpc_error, eos}, State);
-handle_info({gun_trailers, _ConnPid, StreamRef, _Trailers},
+handle_info({gun_trailers, _ConnPid, StreamRef, Trailers},
             #state{stream_ref = StreamRef} = State) ->
-    pause({grpc_error, eos}, State);
+    on_error(trailers_error(Trailers), State);
 handle_info({gun_error, _ConnPid, StreamRef, Reason},
             #state{stream_ref = StreamRef} = State) ->
     pause({stream_error, Reason}, State);
@@ -233,12 +246,28 @@ terminate(Reason, State) ->
 
 %% The connection or the stream is lost, or the server refused the token. The watcher stays, with
 %% what the handler knows, and connects again, it resumes after the last revision which was
-%% handled, so that no event is lost.
-pause(Reason, #state{watcher_name = WatcherName} = State) ->
+%% handled, so that no event is lost. The handler is told once, until the watch is created again.
+pause(Reason, #state{watcher_name = WatcherName, paused = Paused} = State) ->
     ?LOG_WARNING("Watcher ~p is paused: ~p, connect again", [WatcherName, Reason]),
     State1 = disconnect(State),
-    TRef = erlang:start_timer(?CONNECT_RETRY_INTERVAL, self(), connect),
-    {noreply, State1#state{connect_ref = TRef}}.
+    Result = case Paused of
+                 true -> {ok, State1};
+                 false ->
+                     dispatch(?WATCH_EVENT_PAUSED(Reason, State1#state.last_revision),
+                              State1#state{paused = true})
+             end,
+    case Result of
+        {ok, State2} ->
+            TRef = erlang:start_timer(?CONNECT_RETRY_INTERVAL, self(), connect),
+            {noreply, State2#state{connect_ref = TRef}};
+        {stop, StopReason, State2} ->
+            {stop, StopReason, State2}
+    end.
+
+resumed(#state{paused = false} = State) ->
+    {ok, State};
+resumed(#state{last_revision = LastRevision} = State) ->
+    dispatch(?WATCH_EVENT_RESUMED(LastRevision), State#state{paused = false}).
 
 %% Forget the stream and the connection of it, whatever arrives for them later is ignored.
 disconnect(#state{monitor_ref = MRef, create_ref = CreateRef} = State) ->
@@ -314,9 +343,10 @@ handler_crashed(Reason, #state{handler = Module, handler_state = HandlerState,
 %% and whatever it does is not of interest for the way the watcher stops.
 stop_handler(_Reason, #state{handler = undefined}) ->
     ok;
-stop_handler(Reason, #state{handler = Module, handler_state = HandlerState}) ->
+stop_handler(Reason, #state{handler = Module, handler_state = HandlerState} = State) ->
     HandlerState1 =
-        try Module:handle_event(?WATCH_EVENT_STOPPED(Reason), HandlerState) of
+        try Module:handle_event(?WATCH_EVENT_STOPPED(Reason, State#state.last_revision),
+                                HandlerState) of
             {ok, S} -> S;
             {ok, S, hibernate} -> S;
             _ -> HandlerState
@@ -344,9 +374,13 @@ process_response(#{created := true,
                    watch_id := ?WATCH_ID, header := #{revision := Rev}},
                  #state{creating = true} = State) ->
     ?LOG_INFO("Watcher ~p created the watch, revision ~p", [State#state.watcher_name, Rev]),
-    {noreply, State#state{creating = false, last_revision = created_revision(Rev, State)},
-     {continue, process_data}};
-process_response(#{created := true} = Response, State) ->
+    LastRevision = created_revision(Rev, State),
+    State1 = State#state{creating = false, last_revision = LastRevision, auth_failures = 0},
+    case resumed(State1) of
+        {ok, State2} -> {noreply, State2, {continue, process_data}};
+        {stop, Reason, State2} -> {stop, Reason, State2}
+    end;
+process_response(#{created := true, canceled := false} = Response, State) ->
     ?LOG_WARNING("Watcher ~p received unexpected create response: ~p",
                  [State#state.watcher_name, Response]),
     {noreply, State, {continue, process_data}};
@@ -373,30 +407,87 @@ process_response(Response, State) ->
                  [State#state.watcher_name, Response]),
     {noreply, State, {continue, process_data}}.
 
-%% The server cancels a watch, when it was cancelled by the request, or when it is not allowed:
-%% the token is not valid, e.g. after a restart of the members, for a streaming request there is
-%% no interceptor which refreshes it. Refresh it and connect again, which creates the watch with
-%% the new token.
-canceled(#{cancel_reason := Reason} = Response, #state{client = Client} = State)
-  when is_binary(Reason), Reason =/= <<>> ->
+%% The server cancels the watch: when it is not allowed, or the revision to start from is
+%% compacted; when the token is not valid (e.g. after a restart of the members, for a streaming
+%% request there is no interceptor which refreshes it) it is refreshed and the watch is created
+%% again. The others are not going to change by trying again: the watcher stops, with what the
+%% server said, and the revisions in the last event (a watch which is compacted can be created again
+%% from the revision of the compaction).
+canceled(#{cancel_reason := Reason} = Response, State) when is_binary(Reason), Reason =/= <<>> ->
     case is_auth_error(Reason) of
-        true ->
-            ?LOG_WARNING("Watcher ~p was refused: ~s, refresh the token and restart",
-                         [State#state.watcher_name, Reason]),
-            _ = refresh_token(Client),
-            pause({watch_error, invalid_auth_token}, State);
-        false ->
-            canceled_by_request(Response, State)
+        true -> auth_error(Reason, State);
+        false -> canceled_by_server(Response, State)
     end;
 canceled(Response, State) ->
-    canceled_by_request(Response, State).
+    canceled_by_server(Response, State).
 
-canceled_by_request(#{watch_id := WatchId}, State) ->
-    State1 = case dispatch({?WATCH_EVENT_CANCELED, WatchId}, State) of
-                 {ok, S} -> S;
-                 {stop, _, S} -> S
+canceled_by_server(Response, State) ->
+    Reason = case maps:get(compact_revision, Response, 0) of
+                 Compacted when is_integer(Compacted), Compacted > 0 -> {compacted, Compacted};
+                 _ -> maps:get(cancel_reason, Response, <<>>)
              end,
-    {stop, {shutdown, canceled}, State1}.
+    {stop, {shutdown, {canceled, Reason}}, State}.
+
+%% The token was refused: refresh it and connect again, until it keeps being refused.
+auth_error(Reason, #state{client = Client, auth_failures = Failures} = State) ->
+    case Failures + 1 > ?MAX_AUTH_FAILURES of
+        true ->
+            {stop, {auth_failed, Reason}, State};
+        false ->
+            ?LOG_WARNING("Watcher ~p was refused: ~s, refresh the token and connect again",
+                         [State#state.watcher_name, Reason]),
+            _ = refresh_token(Client),
+            pause({auth, Reason}, State#state{auth_failures = Failures + 1})
+    end.
+
+%% What to do with the error of a connection or of a stream: it is the network or the server
+%% which is not available (the watch is paused and connected again), or it is a refusal which is
+%% not going to change (the watcher stops).
+on_error({grpc_error, Status, Message} = Error, State) when is_atom(Status) ->
+    case Status of
+        unauthenticated -> auth_error(grpc_message(Message), State);
+        _ ->
+            case lists:member(Status, [unavailable, deadline_exceeded, internal]) of
+                true -> pause(Error, State);
+                false ->
+                    case is_binary(Message) andalso is_auth_error(Message) of
+                        true -> auth_error(Message, State);
+                        false -> {stop, {grpc_error, Status}, State}
+                    end
+            end
+    end;
+on_error(Reason, State) ->
+    pause(Reason, State).
+
+grpc_message(Message) when is_binary(Message) -> Message;
+grpc_message(Message) -> iolist_to_binary(io_lib:format("~p", [Message])).
+
+%% The trailers of the stream: the end of a response without a status is the end of the stream,
+%% which is connected again; any other status is the one of the call.
+trailers_error(Trailers) when is_list(Trailers) ->
+    case lists:keyfind(<<"grpc-status">>, 1, Trailers) of
+        {_, Status} when Status =/= <<"0">> ->
+            Message = case lists:keyfind(<<"grpc-message">>, 1, Trailers) of
+                          {_, M} -> M;
+                          false -> <<>>
+                      end,
+            {grpc_error, grpc_status(Status), Message};
+        _ ->
+            {grpc_error, eos}
+    end;
+trailers_error(_) ->
+    {grpc_error, eos}.
+
+grpc_status(Bin) ->
+    Names = {cancelled, unknown, invalid_argument, deadline_exceeded, not_found, already_exists,
+             permission_denied, resource_exhausted, failed_precondition, aborted, out_of_range,
+             unimplemented, internal, unavailable, data_loss, unauthenticated},
+    try binary_to_integer(Bin) of
+        N when N >= 1, N =< tuple_size(Names) -> element(N, Names);
+        _ -> unknown
+    catch
+        _:_ -> unknown
+    end.
 
 is_auth_error(Reason) ->
     lists:any(fun(Text) -> binary:match(Reason, Text) =/= nomatch end,
@@ -521,4 +612,43 @@ created_revision_test() ->
     ?assertEqual(100, created_revision(100, State#state{request = #{start_revision => 0}})),
     %% created again after a lost connection: what was handled stays
     ?assertEqual(70, created_revision(100, State#state{last_revision = 70})).
+
+on_error_test() ->
+    State = #state{watcher_name = w, client = c},
+    %% the server or the network is not there: paused, connected again
+    ?assertMatch({noreply, #state{paused = true}},
+                 on_error({grpc_error, unavailable, <<"no leader">>}, State)),
+    ?assertMatch({noreply, _}, on_error({grpc_error, internal, <<>>}, State)),
+    ?assertMatch({noreply, _}, on_error(no_available_connection, State)),
+    ?assertMatch({noreply, _}, on_error({grpc_error, eos}, State)),
+    %% a refusal which is not going to change
+    ?assertMatch({stop, {grpc_error, permission_denied}, _},
+                 on_error({grpc_error, permission_denied, <<"nope">>}, State)),
+    ?assertMatch({stop, {grpc_error, unimplemented}, _},
+                 on_error({grpc_error, unimplemented, <<>>}, State)),
+    %% a token which is refused for ever
+    ?assertMatch({stop, {auth_failed, <<"invalid auth token">>}, _},
+                 on_error({grpc_error, unauthenticated, <<"invalid auth token">>},
+                          State#state{auth_failures = ?MAX_AUTH_FAILURES})).
+
+trailers_error_test() ->
+    ?assertEqual({grpc_error, eos}, trailers_error([])),
+    ?assertEqual({grpc_error, eos}, trailers_error([{<<"grpc-status">>, <<"0">>}])),
+    ?assertEqual({grpc_error, unavailable, <<"going away">>},
+                 trailers_error([{<<"grpc-status">>, <<"14">>}, {<<"grpc-message">>, <<"going away">>}])),
+    ?assertEqual({grpc_error, permission_denied, <<>>},
+                 trailers_error([{<<"grpc-status">>, <<"7">>}])),
+    ?assertEqual({grpc_error, unknown, <<>>}, trailers_error([{<<"grpc-status">>, <<"x">>}])).
+
+canceled_test() ->
+    State = #state{watcher_name = w, client = c},
+    %% a start revision which was compacted can be told from the others
+    ?assertMatch({stop, {shutdown, {canceled, {compacted, 7}}}, _},
+                 canceled(#{canceled => true, compact_revision => 7,
+                            cancel_reason => <<"mvcc: required revision has been compacted">>},
+                          State)),
+    ?assertMatch({stop, {shutdown, {canceled, <<"etcdserver: permission denied">>}}, _},
+                 canceled(#{canceled => true, cancel_reason => <<"etcdserver: permission denied">>},
+                          State)),
+    ?assertMatch({stop, {shutdown, {canceled, <<>>}}, _}, canceled(#{canceled => true}, State)).
 -endif.

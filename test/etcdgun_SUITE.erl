@@ -23,6 +23,10 @@
     watch_handler_remove/1,
     watch_handler_init_failed/1,
     watch_handler_crash_loop/1,
+    watch_paused_resumed/1,
+    watch_stopped_revision/1,
+    watch_compacted/1,
+    watch_auth_failed/1,
     lease_keepalive/1,
     membership_sync/1,
     member_down/1,
@@ -63,6 +67,10 @@ all() ->
         watch_handler_remove,
         watch_handler_init_failed,
         watch_handler_crash_loop,
+        watch_paused_resumed,
+        watch_stopped_revision,
+        watch_compacted,
+        watch_auth_failed,
         lease_keepalive,
         membership_sync,
         member_down,
@@ -346,6 +354,83 @@ watch_handler_crash_loop(_Config) ->
             ?assertMatch({handler_failed, {error, crash_by_request, _}}, Reason)
     after 10000 ->
         ct:fail(watcher_not_stopped)
+    end,
+    _ = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% The handler is told once that the watch is paused, and when it is resumed, both with the
+%% revision of the last event.
+watch_paused_resumed(_Config) ->
+    Prefix = key(),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
+    A = <<Prefix/binary, "/a">>,
+    B = <<Prefix/binary, "/b">>,
+    RevA = put_retry(A, <<"1">>),
+    ?assertMatch([#{kv := #{key := A}}], recv_events()),
+    {monitors, [{process, ConnPid}]} = process_info(Pid, monitors),
+    exit(ConnPid, kill),
+    receive
+        {watch_event, {watch_paused, _Reason, PausedRev}} -> ?assertEqual(RevA, PausedRev)
+    after 5000 ->
+        ct:fail(no_watch_paused)
+    end,
+    put_retry(B, <<"2">>),
+    receive
+        {watch_event, {watch_resumed, ResumedRev}} -> ?assertEqual(RevA, ResumedRev)
+    after 15000 ->
+        ct:fail(no_watch_resumed)
+    end,
+    ?assertMatch([#{kv := #{key := B}}], recv_events()),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% The handler is told that the watcher stops, with the reason and the revision of the last event,
+%% to start from after it.
+watch_stopped_revision(_Config) ->
+    Prefix = key(),
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
+    A = <<Prefix/binary, "/a">>,
+    RevA = put_retry(A, <<"1">>),
+    ?assertMatch([#{kv := #{key := A}}], recv_events()),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher),
+    receive
+        {watch_event, {watch_stopped, Reason, Rev}} ->
+            ?assertEqual(shutdown, Reason),
+            ?assertEqual(RevA, Rev)
+    after 5000 ->
+        ct:fail(no_watch_stopped)
+    end,
+    receive {handler_terminate, shutdown} -> ok after 1000 -> ct:fail(no_terminate) end.
+
+%% A watch which starts at a revision which was compacted is refused by the server, there is
+%% nothing to wait for: the watcher stops with the revision of the compaction.
+watch_compacted(_Config) ->
+    Prefix = key(),
+    Key = <<Prefix/binary, "/a">>,
+    Rev1 = put_retry(Key, <<"1">>),
+    Rev2 = put_retry(Key, <<"2">>),
+    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    {ok, _} = etcdgun_etcdserverpb_kv_client:compact(Channel, #{revision => Rev2}),
+    Req = (watch_req(Prefix))#{start_revision => Rev1},
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), Req),
+    receive
+        {watch_event, {watch_stopped, Reason, _}} ->
+            ?assertEqual({shutdown, {canceled, {compacted, Rev2}}}, Reason)
+    after 10000 ->
+        ct:fail(no_watch_stopped)
+    end,
+    _ = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% The credentials are removed, the token is refused when the watch is created again, and the
+%% refresh fails: the watcher gives up and says why.
+watch_auth_failed(_Config) ->
+    Prefix = key(),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
+    ok = etcdgun_client:unset_cred(?CLIENT),
+    {monitors, [{process, ConnPid}]} = process_info(Pid, monitors),
+    exit(ConnPid, kill),
+    receive
+        {watch_event, {watch_stopped, Reason, _}} -> ?assertMatch({auth_failed, _}, Reason)
+    after 20000 ->
+        ct:fail(no_watch_stopped)
     end,
     _ = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
