@@ -20,7 +20,9 @@
     watch_reconnect/1,
     watch_reconnect_before_event/1,
     watch_handler_crash/1,
-    watch_handler_remove/1,
+    watch_handler_cancel/1,
+    watch_handler_remove_handler/1,
+    watch_cancel_in_handler/1,
     watch_handler_init_failed/1,
     watch_handler_crash_loop/1,
     watch_paused_resumed/1,
@@ -65,7 +67,9 @@ all() ->
         watch_reconnect,
         watch_reconnect_before_event,
         watch_handler_crash,
-        watch_handler_remove,
+        watch_handler_cancel,
+        watch_handler_remove_handler,
+        watch_cancel_in_handler,
         watch_handler_init_failed,
         watch_handler_crash_loop,
         watch_paused_resumed,
@@ -327,21 +331,57 @@ watch_handler_crash(_Config) ->
     ?assertEqual([B], recv_keys(1, 5000)),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
-%% `remove_handler' says the handler does not want events: the watcher stops with `normal', and the
-%% handler is terminated.
-watch_handler_remove(_Config) ->
+%% The handler returns `{cancel_watch, State}': the watch is cancelled as by `cancel_watch/2', the
+%% watcher stops with `shutdown', and the handler is told as it is then, with the revision of the
+%% events which it returned it for (they were given to it).
+watch_handler_cancel(_Config) ->
     Prefix = key(),
     {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
     wait_handler_init(),
     MRef = erlang:monitor(process, Pid),
-    put_retry(<<Prefix/binary, "/a">>, <<"remove">>),
+    Rev = put_retry(<<Prefix/binary, "/a">>, <<"remove">>),
     receive
-        {'DOWN', MRef, process, Pid, Reason} -> ?assertEqual(normal, Reason)
+        {'DOWN', MRef, process, Pid, Reason} -> ?assertEqual(shutdown, Reason)
     after 5000 ->
         ct:fail(watcher_not_stopped)
     end,
-    receive {handler_terminate, remove_handler} -> ok after 1000 -> ct:fail(no_terminate) end,
-    _ = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+    receive
+        {watch_event, {watch_stopped, shutdown, Rev1}} -> ?assertEqual(Rev, Rev1)
+    after 1000 ->
+        ct:fail(no_watch_stopped)
+    end,
+    receive {handler_terminate, shutdown} -> ok after 1000 -> ct:fail(no_terminate) end,
+    %% the name is free
+    ?assertEqual({error, not_found}, etcdgun:cancel_watch(?CLIENT, ct_watcher)).
+
+%% `remove_handler' of the `gen_event' handlers is not a return of the handler anymore: it is
+%% not understood, as any other, the handler is initialised again and the watcher stays.
+watch_handler_remove_handler(_Config) ->
+    Prefix = key(),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
+    wait_handler_init(),
+    put_retry(<<Prefix/binary, "/a">>, <<"legacy">>),
+    wait_handler_init(),
+    ?assertEqual(Pid, whereis(ct_watcher)),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+
+%% The handler can not ask the supervisor to stop the watcher which is waiting for it: it fails at
+%% once, the watcher is not held for its shutdown time and killed.
+watch_cancel_in_handler(_Config) ->
+    Prefix = key(),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
+    wait_handler_init(),
+    {Time, ok} = timer:tc(fun() ->
+        put_retry(<<Prefix/binary, "/a">>, <<"direct">>),
+        receive
+            {cancel_in_handler, {error, called_from_the_handler}} -> ok
+        after 5000 ->
+            ct:fail(no_cancel_in_handler)
+        end
+    end),
+    ?assert(Time < 900000),
+    ?assertEqual(Pid, whereis(ct_watcher)),
+    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
 %% The handler can not be initialised: `watch/5' returns the reason and leaves nothing.
 watch_handler_init_failed(_Config) ->
@@ -646,6 +686,11 @@ watch_invalid_request(_Config) ->
     ?assertEqual({error, {invalid_request, key}}, Watch(Valid#{key := <<>>})),
     ?assertEqual({error, {invalid_request, not_a_map}}, Watch([Valid])),
     ?assertEqual({error, {unsupported_option, fragment}}, Watch(Valid#{fragment => true})),
+    %% there is no watcher without a handler
+    ?assertEqual({error, {invalid_handler, undefined}},
+                 etcdgun:watch(?CLIENT, ct_watcher, undefined, self(), Valid)),
+    ?assertEqual({error, {invalid_handler, no_such_handler_module}},
+                 etcdgun:watch(?CLIENT, ct_watcher, no_such_handler_module, self(), Valid)),
     ?assertEqual(undefined, whereis(ct_watcher)),
     %% `fragment => false' is what the server does by default
     {ok, _} = Watch(Valid#{fragment => false}),

@@ -35,7 +35,7 @@
     stream = undefined :: undefined | egrpc:stream(),
     monitor_ref = undefined :: undefined | reference(),
     conn_pid = undefined :: undefined | pid(),
-    %% The module of the handler, `undefined' when it is removed or was terminated.
+    %% The module of the handler, `undefined' when it was terminated (it crashed too often).
     handler = undefined :: undefined | module(),
     handler_args :: term(),
     handler_state :: term(),
@@ -235,13 +235,16 @@ process_data(#state{buf = Buf, stream = Stream} = State, ParseMsg) ->
             process_response(Msg, update_stream(Stream1, State#state{buf = Rest}))
     end.
 
-terminate(Reason, State) ->
+terminate(Reason, #state{monitor_ref = MRef} = State) ->
     case is_normal(Reason) of
         true -> ?LOG_INFO("Watcher terminating: ~p", [Reason]);
         false -> ?LOG_WARNING("Watcher terminating: ~p", [Reason])
     end,
     % is_normal(Reason) andalso cancel_watches(State),
-    is_reference(State#state.monitor_ref) andalso erlang:demonitor(State#state.monitor_ref, [flush]),
+    case MRef of
+        M when is_reference(M) -> erlang:demonitor(M, [flush]);
+        _ -> ok
+    end,
     cancel_stream(State),
     stop_handler(Reason, State).
 
@@ -300,8 +303,8 @@ init_handler(Module, Args) ->
 %% is no other process which could drop it silently.
 %%
 %% - `{ok, State}': go on.
-%% - `remove_handler': the handler does not want events, the watch has no purpose, the watcher
-%%   stops with `normal'.
+%% - `{cancel_watch, State}': the watch is cancelled, as with `etcdgun:cancel_watch/2', the watcher
+%%   stops with `shutdown' and the handler is told as it is then (`watch_stopped', `terminate').
 %% - a crash (an exception, or a return which is not understood): the handler is initialised
 %%   again and the event is lost; the watcher stops when that happens too often.
 -spec dispatch(term(), #state{}) -> {ok, #state{}} | {stop, term(), #state{}}.
@@ -313,11 +316,8 @@ dispatch(Event, #state{handler = Module, handler_state = HandlerState} = State) 
             {ok, State#state{handler_state = HandlerState1}};
         {ok, HandlerState1, hibernate} ->
             {ok, State#state{handler_state = HandlerState1}};
-        remove_handler ->
-            ?LOG_INFO("Watcher ~p: the handler ~p was removed by its return, stop",
-                      [State#state.watcher_name, Module]),
-            catch_terminate(Module, remove_handler, HandlerState),
-            {stop, normal, State#state{handler = undefined}};
+        {cancel_watch, HandlerState1} ->
+            {stop, shutdown, State#state{handler_state = HandlerState1}};
         Other ->
             handler_crashed({bad_return_value, Other}, State)
     catch
@@ -362,7 +362,8 @@ stop_handler(Reason, #state{handler = Module, handler_state = HandlerState} = St
 
 catch_terminate(Module, Reason, HandlerState) ->
     try
-        Module:terminate(Reason, HandlerState)
+        %% as for `gen_event' the callback is not required
+        erlang:function_exported(Module, terminate, 2) andalso Module:terminate(Reason, HandlerState)
     catch
         Class:Error ->
             ?LOG_WARNING("The terminate of the handler ~p failed: ~p:~p", [Module, Class, Error])
@@ -397,14 +398,16 @@ process_response(#{canceled := true} = Response, State) ->
 %% A progress notification which is for all the watches of the stream has no id of the watch.
 process_response(#{created := false, canceled := false} = Response, State) ->
     %% A progress notification has no events, there is nothing to tell the handler.
+    %% The revision is the one of what the handler is given, before it is: when it asks to stop,
+    %% or it crashes, the response was handled and is not to be given again to start after it.
+    State0 = State#state{last_revision = last_revision(Response)},
     Result = case maps:get(events, Response, []) of
-                 [] -> {ok, State};
-                 Events -> dispatch(?WATCH_EVENT_EVENTS(Events), State)
+                 [] -> {ok, State0};
+                 Events -> dispatch(?WATCH_EVENT_EVENTS(Events), State0)
              end,
     case Result of
         {ok, State1} ->
-            {noreply, State1#state{last_revision = last_revision(Response)},
-             {continue, process_data}};
+            {noreply, State1, {continue, process_data}};
         {stop, Reason, State1} ->
             {stop, Reason, State1}
     end;
@@ -498,6 +501,7 @@ grpc_status(Bin) ->
     end.
 
 is_auth_error(Reason) ->
+    % eqwalizer:ignore
     lists:any(fun(Text) -> binary:match(Reason, Text) =/= nomatch end,
               [<<"invalid auth token">>, <<"user name is empty">>,
                <<"revision of auth store is old">>]).
@@ -516,6 +520,7 @@ refresh_token(Client) ->
 %% everything up to it was sent.
 -spec last_revision(map()) -> integer().
 last_revision(#{events := [_ | _] = Events}) ->
+    % eqwalizer:ignore
     lists:max([maps:get(mod_revision, Kv, 0) || #{kv := Kv} <- Events]);
 last_revision(#{header := #{revision := Revision}}) ->
     Revision.
@@ -578,7 +583,9 @@ process_data_handles_all_responses_test() ->
             {noreply, S1} -> S1
         end
     end,
-    State = #state{client = c, watcher_name = w, request = #{}, stream = stream, creating = true},
+    FakeStream = #{},
+    % eqwalizer:ignore
+    State = #state{client = c, watcher_name = w, request = #{}, stream = FakeStream, creating = true},
     %% every response of the chunk is handled, even when a create response is repeated
     Buf = iolist_to_binary([Frame(Created), Frame(Created), Frame(Created)]),
     Final = Drain(State#state{buf = Buf}),
@@ -622,7 +629,8 @@ created_revision_test() ->
     ?assertEqual(70, created_revision(100, State#state{last_revision = 70})).
 
 on_error_test() ->
-    State = #state{watcher_name = w, client = c},
+    % eqwalizer:ignore
+    State = #state{watcher_name = w, client = c}, %% ignore other fields
     %% the server or the network is not there: paused, connected again
     ?assertMatch({noreply, #state{paused = true}},
                  on_error({grpc_error, unavailable, <<"no leader">>}, State)),
@@ -649,7 +657,8 @@ trailers_error_test() ->
     ?assertEqual({grpc_error, unknown, <<>>}, trailers_error([{<<"grpc-status">>, <<"x">>}])).
 
 canceled_test() ->
-    State = #state{watcher_name = w, client = c},
+    % eqwalizer:ignore
+    State = #state{watcher_name = w, client = c},  %% ignore other fields
     %% a start revision which was compacted can be told from the others
     ?assertMatch({stop, {shutdown, {canceled, {compacted, 7}}}, _},
                  canceled(#{canceled => true, compact_revision => 7,

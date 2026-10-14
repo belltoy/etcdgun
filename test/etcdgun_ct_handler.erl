@@ -1,7 +1,9 @@
 %% A gen_event handler for the watcher tests, sends every event to the pid it was added with.
 %%
 %% The value of a key says what the handler does with the events of it: `crash' makes it raise,
-%% `remove' returns `remove_handler'. The arg `fail' makes the initialisation fail.
+%% `remove' returns `{cancel_watch, State}', `legacy' returns `remove_handler' (which is not one of
+%% its returns anymore), `direct' calls `etcdgun:cancel_watch/2' (which it must not).
+%% The arg `fail' makes the initialisation fail.
 -module(etcdgun_ct_handler).
 
 -behaviour(gen_event).
@@ -22,9 +24,17 @@ handle_event({watch_events, Events}, Pid) ->
     case lists:member(<<"crash">>, Values) of
         true -> error(crash_by_request);
         false ->
-            case lists:member(<<"remove">>, Values) of
-                true -> remove_handler;
-                false -> send({watch_events, Events}, Pid)
+            case [V || V <- [<<"remove">>, <<"legacy">>, <<"direct">>], lists:member(V, Values)] of
+                [<<"remove">> | _] -> {cancel_watch, Pid};
+                [<<"legacy">> | _] -> remove_handler;
+                [<<"direct">> | _] ->
+                    try etcdgun:cancel_watch(etcdgun_ct, ct_watcher) of
+                        Res -> Pid ! {cancel_in_handler, Res}
+                    catch
+                        error:Reason -> Pid ! {cancel_in_handler, {error, Reason}}
+                    end,
+                    {ok, Pid};
+                [] -> send({watch_events, Events}, Pid)
             end
     end;
 handle_event(Event, Pid) ->

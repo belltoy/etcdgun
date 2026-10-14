@@ -89,7 +89,10 @@ close(Client) ->
 %% slow handler holds the watch back. What a handler returns is what the watcher does:
 %% <ul>
 %%   <li>`{ok, State}': the next event is given to it;</li>
-%%   <li>`remove_handler': the watcher stops with the reason `normal';</li>
+%%   <li>`{cancel_watch, State}': the watch is cancelled as by `cancel_watch/2', the watcher stops
+%%       with the reason `shutdown', and the handler gets `{watch_stopped, shutdown, _}' and
+%%       `terminate/2' as it does then. `cancel_watch/2' and `close/1' are not to be called by
+%%       the handler, they raise `called_from_the_handler';</li>
 %%   <li>an exception or any other return: it is initialised again with `EventHandlerArgs' (its
 %%       state is lost, and so is the event, which is given at most once), and the watcher stops
 %%       with `{handler_failed, Reason}' when that happens more than 5 times in 10 seconds.</li>
@@ -118,8 +121,8 @@ close(Client) ->
 %% up when the network or the cluster is not available, and it is not restarted when it stops.
 %% The reason of the exit is:
 %% <ul>
-%%   <li>`shutdown': `cancel_watch/2', `close/1' of the client, or the application is stopped;</li>
-%%   <li>`normal': the handler returned `remove_handler';</li>
+%%   <li>`shutdown': `cancel_watch/2', `close/1' of the client, the application is stopped, or the
+%%       handler returned `{cancel_watch, State}';</li>
 %%   <li>`{shutdown, {canceled, {compacted, Revision}}}': the revision to start from was
 %%       compacted, it is `Revision' which the store is compacted to;</li>
 %%   <li>`{shutdown, {canceled, Reason}}': the server cancelled the watch (it is not allowed, ...);</li>
@@ -133,7 +136,9 @@ close(Client) ->
 %% The reason which a monitor gets is `killed' or `noproc' when the watcher was killed or ended
 %% before it was monitored.
 %%
-%% `{error, {handler_init, Reason}}' is returned when the initialisation of the handler fails.
+%% `{error, {invalid_handler, EventHandler}}' is returned when there is no handler: it is not a
+%% module which has `init/1' and `handle_event/2'. `{error, {handler_init, Reason}}' is returned
+%% when the initialisation of the handler fails.
 %%
 %% `{error, {invalid_request, _}}' is returned when `Request' has no `key', and
 %% `{error, {unsupported_option, fragment}}' when it asks for fragments, which are not supported.
@@ -157,6 +162,7 @@ prefix_range_end(Key) when is_binary(Key) ->
 
 prefix_range_end(Key) when is_list(Key) ->
     RangeEndRev = lists:reverse(Key),
+    % eqwalizer:ignore
     lists:reverse(find_prefix_rev(RangeEndRev)).
 
 find_prefix_rev([]) -> ?UNBOUND_RANGE_END;
