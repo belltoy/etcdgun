@@ -93,16 +93,17 @@ close(Client) ->
 %%       with the reason `shutdown', and the handler gets `{watch_stopped, shutdown, _}' and
 %%       `terminate/2' as it does then. `cancel_watch/2' and `close/1' are not to be called by
 %%       the handler, they raise `called_from_the_handler';</li>
-%%   <li>an exception or any other return: it is initialised again with `EventHandlerArgs' (its
-%%       state is lost, and so is the event, which is given at most once), and the watcher stops
-%%       with `{handler_failed, Reason}' when that happens more than 5 times in 10 seconds.</li>
+%%   <li>an exception or any other return: it crashed, its `terminate({error, Reason}, State)' is
+%%       called, and the watcher stops with `{handler_failed, Reason, LastRevision}' (it is not
+%%       restarted). The events which it crashed at are not counted in `LastRevision', so that
+%%       watching again from `LastRevision + 1' gives them again.</li>
 %% </ul>
-%% What a handler does with the events is its own matter. When it crashes the watcher can not know
-%% how much of them it had done, so it does not give them again, and a crash is not a way to try
-%% again. A handler which can not lose an event catches its errors in `handle_event/2' and decides
-%% (try again, keep the event, or return `{cancel_watch, State}'). A crash is seen in the log, in
-%% `terminate({error, Reason}, State)' of the handler, which is called first, and in `init/1',
-%% which is called again.
+%% The events are given <b>at least once</b>: when the handler crashed after it did a part of
+%% them, they are given from the start of what the server sent at once (a response, up to a
+%% thousand revisions when it catches up). A handler has to be idempotent, or to tell what it
+%% handled already by the revision of the events (`mod_revision' of the key value). The one who
+%% watches is the one who watches again, with the backoff of its own, and decides what to do
+%% with events which a handler always crashes at.
 %%
 %% The events are:
 %% <ul>
@@ -137,7 +138,8 @@ close(Client) ->
 %%       server;</li>
 %%   <li>`{auth_failed, Reason}': the token was refused again after it was refreshed, e.g. the
 %%       credentials were changed or removed;</li>
-%%   <li>`{handler_failed, Reason}': the handler crashed too often;</li>
+%%   <li>`{handler_failed, Reason, LastRevision}': the handler crashed, `LastRevision' is the
+%%       revision of the last events which it handled, to watch from after it (or `undefined');</li>
 %%   <li>any other: it crashed.</li>
 %% </ul>
 %% The reason which a monitor gets is `killed' or `noproc' when the watcher was killed or ended

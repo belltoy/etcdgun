@@ -37,10 +37,7 @@
     conn_pid = undefined :: undefined | pid(),
     %% The module of the handler, `undefined' when it was terminated (it crashed too often).
     handler = undefined :: undefined | module(),
-    handler_args :: term(),
     handler_state :: term(),
-    %% The times of the latest crashes of the handler.
-    handler_crashes = [] :: [integer()],
     create_ref = undefined :: undefined | reference(),
     %% The response of the creation is not received yet.
     creating = false :: boolean(),
@@ -60,10 +57,6 @@
 -define(WATCH_EVENT_STOPPED(Reason, LastRevision), {watch_stopped, Reason, LastRevision}).
 
 -define(CONNECT_RETRY_INTERVAL, 1000).
-%% A handler which crashes more than this often in the period is given up, or a handler which
-%% crashes at every event would be initialised again and again.
--define(HANDLER_MAX_CRASHES, 5).
--define(HANDLER_CRASH_PERIOD, 10000).
 %% A token which is refused this many times in a row, although it was refreshed, is not going to
 %% be accepted: the credentials were changed or removed.
 -define(MAX_AUTH_FAILURES, 3).
@@ -92,7 +85,6 @@ init({Client, WatcherName, Handler, HandlerArgs, Request}) ->
                 watcher_name = WatcherName,
                 request = Request#{watch_id => ?WATCH_ID},
                 handler = Module,
-                handler_args = HandlerArgs,
                 handler_state = HandlerState
             },
             %% The first attempt is made here, so that the watch is created when
@@ -305,8 +297,10 @@ init_handler(Module, Args) ->
 %% - `{ok, State}': go on.
 %% - `{cancel_watch, State}': the watch is cancelled, as with `etcdgun:cancel_watch/2', the watcher
 %%   stops with `shutdown' and the handler is told as it is then (`watch_stopped', `terminate').
-%% - a crash (an exception, or a return which is not understood): the handler is initialised
-%%   again and the event is lost; the watcher stops when that happens too often.
+%% - a crash (an exception, or a return which is not understood): the watcher stops with
+%%   `{handler_failed, Reason, LastRevision}', where the last revision is of what the handler
+%%   handled before (see `process_response/2'), to watch again from after it: the events it
+%%   crashed at are given again. How much of them it did is not known to the watcher.
 -spec dispatch(term(), #state{}) -> {ok, #state{}} | {stop, term(), #state{}}.
 dispatch(_Event, #state{handler = undefined} = State) ->
     {ok, State};
@@ -326,23 +320,13 @@ dispatch(Event, #state{handler = Module, handler_state = HandlerState} = State) 
     end.
 
 handler_crashed(Reason, #state{handler = Module, handler_state = HandlerState,
-                               handler_args = Args} = State) ->
-    ?LOG_ERROR("Watcher ~p: the handler ~p crashed: ~p, initialise it again",
+                               last_revision = LastRevision} = State) ->
+    ?LOG_ERROR("Watcher ~p: the handler ~p crashed: ~p, stop",
                [State#state.watcher_name, Module, Reason]),
     catch_terminate(Module, {error, Reason}, HandlerState),
-    Now = erlang:monotonic_time(millisecond),
-    Crashes = [T || T <- [Now | State#state.handler_crashes], Now - T < ?HANDLER_CRASH_PERIOD],
-    case length(Crashes) > ?HANDLER_MAX_CRASHES of
-        true ->
-            {stop, {handler_failed, Reason}, State#state{handler = undefined}};
-        false ->
-            case init_handler(Module, Args) of
-                {ok, HandlerState1} ->
-                    {ok, State#state{handler_state = HandlerState1, handler_crashes = Crashes}};
-                {error, InitReason} ->
-                    {stop, {handler_failed, {init, InitReason}}, State#state{handler = undefined}}
-            end
-    end.
+    %% It is not told that the watcher stops, it is terminated. The revision is in the reason to
+    %% watch again from, as the events which it crashed at were not handled.
+    {stop, {handler_failed, Reason, LastRevision}, State#state{handler = undefined}}.
 
 %% The watcher stops: the handler is told, and terminated. It does not have to be there anymore,
 %% and whatever it does is not of interest for the way the watcher stops.
@@ -398,16 +382,20 @@ process_response(#{canceled := true} = Response, State) ->
 %% A progress notification which is for all the watches of the stream has no id of the watch.
 process_response(#{created := false, canceled := false} = Response, State) ->
     %% A progress notification has no events, there is nothing to tell the handler.
-    %% The revision is the one of what the handler is given, before it is: when it asks to stop,
-    %% or it crashes, the response was handled and is not to be given again to start after it.
-    State0 = State#state{last_revision = last_revision(Response)},
+    %% The revision is of what the handler has handled, it is set when it returned: when it
+    %% crashes the watcher stops with the one before, and watching from after it gives the events
+    %% again (they are given at least once). When the handler asks to cancel the watch it has
+    %% handled them.
+    LastRevision = last_revision(Response),
     Result = case maps:get(events, Response, []) of
-                 [] -> {ok, State0};
-                 Events -> dispatch(?WATCH_EVENT_EVENTS(Events), State0)
+                 [] -> {ok, State};
+                 Events -> dispatch(?WATCH_EVENT_EVENTS(Events), State)
              end,
     case Result of
         {ok, State1} ->
-            {noreply, State1, {continue, process_data}};
+            {noreply, State1#state{last_revision = LastRevision}, {continue, process_data}};
+        {stop, shutdown, State1} ->
+            {stop, shutdown, State1#state{last_revision = LastRevision}};
         {stop, Reason, State1} ->
             {stop, Reason, State1}
     end;

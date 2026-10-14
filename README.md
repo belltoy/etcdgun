@@ -141,16 +141,18 @@ it: `Request#{start_revision => LastRevision + 1}`.
 A handler must have a clause for the events which are not of interest. It returns `{ok, State}`,
 or `{cancel_watch, State}` to cancel the watch (it is the way to do it from the handler, calling
 `etcdgun:cancel_watch/2` or `etcdgun:close/1` there raises `called_from_the_handler`). Any other
-return, or an exception, is a crash of the handler: it is initialised again with `HandlerArgs`,
-its state and the events it was given are lost (they are given at most once), and the watcher
-stops with `{handler_failed, Reason}` when it happens more than 5 times in 10 seconds.
+return, or an exception, is a crash of the handler: its `terminate({error, Reason}, State)` is
+called and the watcher stops with `{handler_failed, Reason, LastRevision}`. It is not restarted,
+and `LastRevision` does not count the events which the handler crashed at, so that watching again
+from `LastRevision + 1` gives them again.
 
-What a handler does with the events is its own matter: when it crashes the watcher can not know
-how much of them it had done, so it does not give them again, and a crash is not a way to try
-again. A handler which can not lose an event catches its errors in `handle_event/2` and decides
-(try again, keep the event, or return `{cancel_watch, State}`). A crash is seen in the log, in the
-`terminate({error, Reason}, State)` of the handler which is called first, and in its `init/1`
-which is called again.
+The events are given **at least once**. When a handler crashed after it did a part of the events
+they are given again from the start of what the server sent at once (a response, which is up to
+a thousand revisions when it catches up), so a handler has to be idempotent, or tell what it did
+already by the revision of the events (`mod_revision` of the key value). The one who watches
+watches again, with a backoff of its own, and decides what to do with events which a handler
+always crashes at, or the watch would end and start again for ever. The state of a handler is
+gone with the watcher: keep what it needs, or read it from etcd again before watching.
 
 The watcher does not give up when the network or the cluster is not available, it tries again
 every second. It stops, and is not restarted, when it is not going to change by trying again.
@@ -163,7 +165,7 @@ Monitor the pid to know, the reason of the exit is:
 | `{shutdown, {canceled, Reason}}` | the server cancelled the watch, e.g. it is not allowed |
 | `{grpc_error, Status}` | the call was refused, not for the network or the availability of the server |
 | `{auth_failed, Reason}` | the token was refused again after it was refreshed, e.g. the credentials were changed or removed |
-| `{handler_failed, Reason}` | the handler crashed too often |
+| `{handler_failed, Reason, LastRevision}` | the handler crashed; `LastRevision` is of the last events it handled, to watch again from after it |
 
 Things to know:
 

@@ -24,7 +24,6 @@
     watch_handler_remove_handler/1,
     watch_cancel_in_handler/1,
     watch_handler_init_failed/1,
-    watch_handler_crash_loop/1,
     watch_paused_resumed/1,
     watch_stopped_revision/1,
     watch_compacted/1,
@@ -71,7 +70,6 @@ all() ->
         watch_handler_remove_handler,
         watch_cancel_in_handler,
         watch_handler_init_failed,
-        watch_handler_crash_loop,
         watch_paused_resumed,
         watch_stopped_revision,
         watch_compacted,
@@ -316,19 +314,46 @@ watch_reconnect_before_event(_Config) ->
     ?assertEqual(Pid, whereis(ct_watcher)),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
-%% A handler which crashes is initialised again, the watcher stays (it is not an event manager
-%% which drops the handler silently), and the events after it are given.
+%% A handler which crashes stops the watcher with the revision of what it handled before: the
+%% events are not lost, watching again from after it gives them again (and again, as long as the
+%% handler crashes at them, which is for the one who watches to decide).
 watch_handler_crash(_Config) ->
     Prefix = key(),
-    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
+    Req = watch_req(Prefix),
+    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), Req),
     wait_handler_init(),
+    MRef = erlang:monitor(process, Pid),
     A = <<Prefix/binary, "/a">>,
     B = <<Prefix/binary, "/b">>,
-    put_retry(A, <<"crash">>),
+    C = <<Prefix/binary, "/c">>,
+    RevA = put_retry(A, <<"1">>),
+    ?assertMatch([#{kv := #{key := A}}], recv_events()),
+    RevB = put_retry(B, <<"crash">>),
+    receive
+        {'DOWN', MRef, process, Pid, Reason} ->
+            ?assertMatch({handler_failed, {error, crash_by_request, _}, RevA}, Reason)
+    after 5000 ->
+        ct:fail(watcher_not_stopped)
+    end,
+    receive {handler_terminate, {error, _}} -> ok after 1000 -> ct:fail(no_terminate) end,
+    %% not restarted, and the name is free
+    ?assertEqual(undefined, whereis(ct_watcher)),
+    %% from after the last revision which was handled: the events are given again
+    {ok, Pid2} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(),
+                               Req#{start_revision => RevA + 1}),
     wait_handler_init(),
-    ?assertEqual(Pid, whereis(ct_watcher)),
-    put_retry(B, <<"1">>),
-    ?assertEqual([B], recv_keys(1, 5000)),
+    MRef2 = erlang:monitor(process, Pid2),
+    receive
+        {'DOWN', MRef2, process, Pid2, Reason2} ->
+            ?assertMatch({handler_failed, {error, crash_by_request, _}, RevA}, Reason2)
+    after 5000 ->
+        ct:fail(watcher_not_stopped)
+    end,
+    %% from after them, to go on
+    put_retry(C, <<"3">>),
+    {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(),
+                            Req#{start_revision => RevB + 1}),
+    ?assertEqual([C], recv_keys(1, 5000)),
     ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
 %% The handler returns `{cancel_watch, State}': the watch is cancelled as by `cancel_watch/2', the
@@ -354,16 +379,20 @@ watch_handler_cancel(_Config) ->
     %% the name is free
     ?assertEqual({error, not_found}, etcdgun:cancel_watch(?CLIENT, ct_watcher)).
 
-%% `remove_handler' of the `gen_event' handlers is not a return of the handler anymore: it is
-%% not understood, as any other, the handler is initialised again and the watcher stays.
+%% `remove_handler' of the `gen_event' handlers is not a return of the handler anymore: it is not
+%% understood, as any other, it is a crash of the handler.
 watch_handler_remove_handler(_Config) ->
     Prefix = key(),
     {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
     wait_handler_init(),
+    MRef = erlang:monitor(process, Pid),
     put_retry(<<Prefix/binary, "/a">>, <<"legacy">>),
-    wait_handler_init(),
-    ?assertEqual(Pid, whereis(ct_watcher)),
-    ok = etcdgun:cancel_watch(?CLIENT, ct_watcher).
+    receive
+        {'DOWN', MRef, process, Pid, Reason} ->
+            ?assertMatch({handler_failed, {bad_return_value, remove_handler}, _}, Reason)
+    after 5000 ->
+        ct:fail(watcher_not_stopped)
+    end.
 
 %% The handler can not ask the supervisor to stop the watcher which is waiting for it: it fails at
 %% once, the watcher is not held for its shutdown time and killed.
@@ -389,22 +418,6 @@ watch_handler_init_failed(_Config) ->
                  etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, fail, watch_req(key()))),
     ?assertEqual(undefined, whereis(ct_watcher)),
     ?assertEqual({error, not_found}, etcdgun:cancel_watch(?CLIENT, ct_watcher)).
-
-%% A handler which crashes at every event is given up, not initialised forever.
-watch_handler_crash_loop(_Config) ->
-    Prefix = key(),
-    {ok, Pid} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
-    wait_handler_init(),
-    MRef = erlang:monitor(process, Pid),
-    [put_retry(<<Prefix/binary, "/", (integer_to_binary(I))/binary>>, <<"crash">>)
-     || I <- lists:seq(1, 8)],
-    receive
-        {'DOWN', MRef, process, Pid, Reason} ->
-            ?assertMatch({handler_failed, {error, crash_by_request, _}}, Reason)
-    after 10000 ->
-        ct:fail(watcher_not_stopped)
-    end,
-    _ = etcdgun:cancel_watch(?CLIENT, ct_watcher).
 
 %% The handler is told once that the watch is paused, and when it is resumed, both with the
 %% revision of the last event.
