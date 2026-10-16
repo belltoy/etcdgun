@@ -90,10 +90,10 @@ hide_cred_test() ->
     ?assertEqual({error, invalid_cred}, hide_cred(#{cred => {"root", ""}})).
 
 removed_option_test() ->
-    % eqwalizer:ignore
     ?assertEqual({error, {removed_option, unary_interceptors}},
+                % eqwalizer:ignore
                  start_child(c, [], #{unary_interceptors => []})),
-    % eqwalizer:ignore
     ?assertEqual({error, {removed_option, stream_interceptors}},
+                % eqwalizer:ignore
                  start_child(c, [], #{cred => {"u", "p"}, stream_interceptors => []})).
 -endif.

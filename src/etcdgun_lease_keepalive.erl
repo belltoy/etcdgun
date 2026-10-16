@@ -148,10 +148,12 @@ revoke(#state{client = Client, lease_id = LeaseId}) ->
 -include_lib("eunit/include/eunit.hrl").
 
 schedule_test() ->
-    State = schedule(#state{ttl = 9, timer_ref = undefined}),
+    State = schedule(#state{lease_id = 1, ttl = 9, timer_ref = undefined}),
     ?assert(is_reference(State#state.timer_ref)),
+    % eqwalizer:ignore
     erlang:cancel_timer(State#state.timer_ref),
     %% a short time to live is still a second
-    State1 = schedule(#state{ttl = 1, timer_ref = undefined}),
+    State1 = schedule(#state{lease_id = 2, ttl = 1, timer_ref = undefined}),
+    % eqwalizer:ignore
     ?assert(erlang:cancel_timer(State1#state.timer_ref) > 900).
 -endif.

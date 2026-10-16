@@ -7,6 +7,7 @@ words = [
     "etcd",
     "eunit",
     "gpb",
+    "hasleader",
     "ifdef",
     "ipath",
     "keepalive",
