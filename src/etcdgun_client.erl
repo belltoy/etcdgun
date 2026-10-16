@@ -56,8 +56,15 @@
     %% The endpoints which were given, where the client goes back to when the members can not
     %% be found.
     seeds :: [etcdgun:endpoint()],
-    %% The endpoints of the channel.
+    %% The endpoints of the members.
     endpoints :: [etcdgun:endpoint()],
+    %% What the checks of the endpoints say, an endpoint is not used until it is `healthy'.
+    health = #{} :: #{binary() => healthy | pending | unhealthy},
+    %% The endpoints of the channel, with `healthy' in the attributes.
+    published = [] :: [map()],
+    probing = #{} :: #{binary() => {pid(), reference()}},
+    probe_tref = undefined :: undefined | reference(),
+    probe_tick = 0 :: non_neg_integer(),
     transport :: tcp | tls,
     members :: #{member_id() => member()},
     membership_tref = undefined :: undefined | reference(),
@@ -79,6 +86,11 @@
 %% How long to wait for the first endpoint to be connected.
 -define(CONNECT_TIMEOUT, 5000).
 -define(MEMBERSHIP_CHECK_INTERVAL, 300_000). % 5 minutes
+%% The endpoints which are not healthy are checked every interval, the healthy ones every
+%% `?HEALTHY_EVERY' intervals.
+-define(PROBE_INTERVAL, 1000).
+-define(HEALTHY_EVERY, 10).
+-define(PROBE_TIMEOUT, 3000).
 
 client_info(Client) ->
     gen_server:call(Client, client_info).
@@ -234,6 +246,7 @@ do_init(Client, Endpoints, Opts0, Cred, Transport) ->
     %% are made.
     ChannelOpts = with_transport(#{
         target => Endpoints,
+        balancer => etcdgun_balancer,
         retry => etcdgun_retry:policy(),
         call_credentials => fun etcdgun_interceptor_auth:call_credentials/1,
         interceptors => [etcdgun_interceptor_auth | maps:get(interceptors, Opts0, [])],
@@ -259,10 +272,10 @@ do_init(Client, Endpoints, Opts0, Cred, Transport) ->
         {ok, Token} ?= authenticate_bootstrap(Client, Cred),
         State1 = publish_token(State0#state{token = Token}),
         {ok, Members} ?= get_member_list(Client, Token),
-        ok ?= check_leader(Client, Token),
-        State2 = apply_members(Members, State1),
+        ok ?= check_endpoint(Client, Token, etcdgun_retry:opts(etcdgun_etcdserverpb_maintenance_stub, status)),
+        State2 = initial_probe(apply_members(Members, State1)),
         ?LOG_INFO(#{msg => "Connected to etcd", members => Members}),
-        {ok, start_membership_timer(State2)}
+        {ok, start_membership_timer(start_probe_timer(?PROBE_INTERVAL, State2))}
     else
         {error, Reason} ->
             ?LOG_ERROR("Failed to connect to etcd endpoints: ~p, reason: ~p", [Endpoints, Reason]),
@@ -278,7 +291,7 @@ wait_ready(Client) ->
     end.
 
 handle_call(client_info, _From, State) ->
-    {Actives, Connectings} = subchannels(State#state.name),
+    {Actives, Connectings} = subchannels(State),
     Reply = #{
         name => State#state.name,
         pid => self(),
@@ -362,16 +375,19 @@ handle_info({timeout, TRef, check_membership}, #state{membership_tref = TRef} = 
 handle_info({sync_membership, NewMembers}, State) ->
     {noreply, apply_members(NewMembers, State)};
 
-%% No member can be found and no endpoint is connected: the members may have all moved, the
-%% endpoints which were given are tried again as well.
-handle_info({sync_failed, _Reason}, #state{name = Client, seeds = Seeds, endpoints = Endpoints} = State) ->
-    case egrpc_channel:connectivity(Client) of
-        ready ->
-            {noreply, State};
+%% The endpoints which were given are in the channel while no member is healthy, see `publish/1'.
+handle_info({sync_failed, _Reason}, State) ->
+    {noreply, State};
+
+handle_info({timeout, TRef, probe}, #state{probe_tref = TRef} = State) ->
+    {noreply, probe(State#state{probe_tref = undefined})};
+handle_info({probe_result, Id, Pid, Result}, #state{probing = Probing} = State) ->
+    case Probing of
+        #{Id := {Pid, MRef}} ->
+            erlang:demonitor(MRef, [flush]),
+            {noreply, probe_result(Id, Result, State#state{probing = maps:remove(Id, Probing)})};
         _ ->
-            All = lists:usort(Seeds ++ Endpoints),
-            ok = egrpc_channel:update_endpoints(Client, All),
-            {noreply, State#state{endpoints = All}}
+            {noreply, State}
     end;
 
 handle_info({refreshed, Pid, Result}, #state{refreshing = #refresh{pid = Pid} = Refresh} = State) ->
@@ -381,6 +397,16 @@ handle_info({'DOWN', MRef, process, Pid, Reason},
             #state{refreshing = #refresh{pid = Pid, mref = MRef}} = State) ->
     ?LOG_ERROR("The refresh of the token of client ~p crashed: ~p", [State#state.name, Reason]),
     {noreply, finish_refresh({error, {refresh_crashed, Reason}}, State)};
+
+handle_info({'DOWN', MRef, process, Pid, Reason}, #state{probing = Probing} = State) ->
+    case [Id || Id := {P, M} <- Probing, P =:= Pid, M =:= MRef] of
+        [Id] ->
+            ?LOG_WARNING("The check of ~s crashed: ~p", [Id, Reason]),
+            {noreply, probe_result(Id, {error, {probe_crashed, Reason}},
+                                   State#state{probing = maps:remove(Id, Probing)})};
+        [] ->
+            {noreply, State}
+    end;
 
 handle_info(Info, State) ->
     ?LOG_WARNING("Received unexpected info message: ~p", [Info]),
@@ -395,7 +421,8 @@ format_status(Status) ->
 redact(undefined) -> undefined;
 redact(_Secret) -> '<redacted>'.
 
-terminate(_Reason, #state{name = Name}) ->
+terminate(_Reason, #state{name = Name, probing = Probing}) ->
+    [exit(Pid, kill) || {Pid, _} <- maps:values(Probing)],
     ?LOG_NOTICE("Terminating etcdgun client, reason: ~p", [_Reason]),
     _ = egrpc_channel:stop(Name),
     ets:delete(?TOKEN_TABLE, Name),
@@ -478,12 +505,30 @@ get_member_list(Client, Token) ->
             end
     end.
 
-%% Etcd 3.6 and later require the token for the status of a member, 3.5 only for the keys, and a
-%% cluster without a leader can not serve the requests: both are better told at the start.
-check_leader(Client, Token) ->
-    Opts = etcdgun_retry:opts(etcdgun_etcdserverpb_maintenance_stub, status),
+%% What an endpoint has to pass before it is used (and when it is connected again, it is checked
+%% again every few seconds): the health service answers, and the member knows a leader. Etcd 3.6
+%% and later require the token for the status of a member, 3.5 only for the keys: a client without
+%% credentials is told at the start.
+check_endpoint(Client, Token, Opts) ->
+    maybe
+        ok ?= check_health(Client, Opts),
+        check_leader(Client, Token, Opts)
+    end.
+
+check_health(Client, Opts) ->
+    case egrpc_grpc_health_v1_health_stub:check(Client, #{}, Opts) of
+        {ok, #{status := Status}} when Status =:= 'SERVING'; Status =:= 1;
+                                       Status =:= 'UNKNOWN'; Status =:= 0 -> ok;
+        {ok, #{status := Status}} -> {error, {unhealthy, Status}};
+        {error, Reason} -> {error, Reason}
+    end.
+
+check_leader(Client, Token, Opts) ->
     case etcdgun_etcdserverpb_maintenance_stub:status(Client, #{}, Opts) of
         {ok, #{leader := 0}} -> {error, no_leader};
+        {ok, #{errors := [_ | _] = Errors}} ->
+            ?LOG_WARNING("Errors reported by etcd server: ~s", [lists:join("; ", Errors)]),
+            ok;
         {ok, _} -> ok;
         {error, Reason} ->
             case is_auth_required(Token, Reason) of
@@ -506,23 +551,110 @@ is_auth_required(undefined, {grpc_error, _, _} = Reason) ->
 is_auth_required(undefined, Reason) -> Reason =:= {etcd_error, user_empty};
 is_auth_required(_Token, _Reason) -> false.
 
-%% The members are the endpoints of the channel. Nothing is changed when there are none (the
-%% answer of a cluster which is starting, ...), nor when they are the same.
+%% The members are the endpoints of the channel, once they pass the check. Nothing is changed
+%% when there are none (the answer of a cluster which is starting, ...).
 apply_members([], State) ->
     State;
-apply_members(Members, #state{name = Name, transport = Transport, endpoints = Old} = State) ->
-    Endpoints = member_endpoints(Members, Transport),
-    case Endpoints of
+apply_members(Members, #state{transport = Transport, endpoints = Old, health = Health} = State) ->
+    case member_endpoints(Members, Transport) of
         [] ->
             ?LOG_WARNING("No member with a client URL of the transport ~p: ~p", [Transport, Members]),
             State;
-        Old ->
-            State#state{members = members_map(Members)};
-        _ ->
-            ?LOG_INFO("Endpoints of etcd members: ~p, were ~p", [Endpoints, Old]),
-            ok = egrpc_channel:update_endpoints(Name, Endpoints),
-            State#state{members = members_map(Members), endpoints = Endpoints}
+        Endpoints ->
+            Endpoints =/= Old andalso ?LOG_INFO("Endpoints of etcd members: ~p, were ~p", [Endpoints, Old]),
+            Ids = [endpoint_id(E) || E <- Endpoints],
+            publish(State#state{members = members_map(Members), endpoints = Endpoints,
+                                health = maps:with(Ids, Health)})
     end.
+
+endpoint_id({Host, Port}) ->
+    iolist_to_binary([Host, ":", integer_to_binary(Port)]).
+
+%% The endpoints of the channel: the members, `healthy' when they passed the check. The ones which
+%% were given stay while no member is healthy, so the members can be found again (and checked)
+%% when all of them moved.
+publish(#state{seeds = Seeds, endpoints = Endpoints, health = Health, published = Old, name = Name} = State) ->
+    Members = [endpoint_spec(E, maps:get(endpoint_id(E), Health, pending) =:= healthy) || E <- Endpoints],
+    AnyHealthy = lists:any(fun(#{attributes := #{healthy := H}}) -> H end, Members),
+    Given = case AnyHealthy of
+        true -> [];
+        false -> [endpoint_spec(S, true) || S <- Seeds, not lists:member(S, Endpoints)]
+    end,
+    case Members ++ Given of
+        Old ->
+            State;
+        New ->
+            ok = egrpc_channel:update_endpoints(Name, New),
+            State#state{published = New}
+    end.
+
+endpoint_spec({Host, Port} = E, Healthy) ->
+    #{host => Host, port => Port, id => endpoint_id(E), attributes => #{healthy => Healthy}}.
+
+%% The members are checked as they connect before the client is returned, as far as they do in a few
+%% seconds: the others are checked by `probe/1' later. A check can not refresh the token here, the
+%% client is not running yet (the token was just made).
+initial_probe(State) ->
+    initial_probe(State, erlang:monotonic_time(millisecond) + ?PROBE_TIMEOUT).
+
+initial_probe(#state{name = Name, endpoints = Endpoints, health = Health} = State, Until) ->
+    Due = [endpoint_id(E) || E <- Endpoints, maps:get(endpoint_id(E), Health, pending) =/= healthy],
+    case Due =:= [] orelse erlang:monotonic_time(millisecond) >= Until of
+        true ->
+            State;
+        false ->
+            Self = self(),
+            Pids = [spawn_link(fun() -> Self ! {checked, self(), Id, check_member(Name, Id, true)} end)
+                    || Id <- Due],
+            Results = [receive {checked, Pid, Id, Result} -> {Id, Result} end || {Pid, Id} <- lists:zip(Pids, Due)],
+            Health1 = lists:foldl(fun({Id, ok}, H) -> H#{Id => healthy};
+                                     ({Id, {error, _}}, H) -> H#{Id => unhealthy}
+                                  end, Health, Results),
+            case lists:all(fun({_, R}) -> R =:= ok end, Results) of
+                true -> ok;
+                false -> timer:sleep(100)
+            end,
+            initial_probe(publish(State#state{health = Health1}), Until)
+    end.
+
+%% Check one endpoint, by the hint to the balancer.
+check_member(Client, Id, NoRefresh) ->
+    Opts = #{attributes => #{etcdgun_target => Id, etcdgun_no_refresh => NoRefresh}, retry => false,
+             deadline => ?PROBE_TIMEOUT},
+    check_endpoint(Client, undefined, Opts).
+
+start_probe_timer(Interval, State) ->
+    State#state{probe_tref = erlang:start_timer(Interval, self(), probe)}.
+
+%% Check the endpoints which are due, every one by a process of its own which asks the endpoint
+%% (see `etcdgun_balancer') and does not wait for the others.
+probe(#state{name = Name, endpoints = Endpoints, health = Health, probing = Probing, probe_tick = Tick0} = State0) ->
+    Tick = Tick0 + 1,
+    Self = self(),
+    Due = [Id || E <- Endpoints, Id <- [endpoint_id(E)], not is_map_key(Id, Probing),
+                 maps:get(Id, Health, pending) =/= healthy orelse Tick rem ?HEALTHY_EVERY =:= 0],
+    Started = #{Id => spawn_monitor(
+                        fun() ->
+                            Self ! {probe_result, Id, self(), check_member(Name, Id, false)}
+                        end) || Id <- Due},
+    start_probe_timer(?PROBE_INTERVAL, State0#state{probing = maps:merge(Probing, Started), probe_tick = Tick}).
+
+probe_result(Id, Result, #state{health = Health, endpoints = Endpoints} = State) ->
+    case lists:any(fun(E) -> endpoint_id(E) =:= Id end, Endpoints) of
+        false -> State; %% not a member any more
+        true -> set_health(Id, maps:get(Id, Health, pending), Result, State)
+    end.
+
+set_health(_Id, healthy, ok, State) ->
+    State;
+set_health(Id, _Prev, ok, #state{health = Health} = State) ->
+    ?LOG_INFO("Etcd endpoint ~s is healthy", [Id]),
+    publish(State#state{health = Health#{Id => healthy}});
+set_health(_Id, unhealthy, {error, _}, State) ->
+    State;
+set_health(Id, _Prev, {error, Reason}, #state{health = Health} = State) ->
+    ?LOG_WARNING("Etcd endpoint ~s is not used: ~p", [Id, Reason]),
+    publish(State#state{health = Health#{Id => unhealthy}}).
 
 %% elp:ignore W0036
 members_map(Members) -> maps:from_list([{Id, M} || #{'ID' := Id} = M <- Members]).
@@ -538,11 +670,13 @@ member_endpoint(Urls, Transport) ->
         [] -> []
     end.
 
-%% The subchannels which can take calls, and the others.
-subchannels(Name) ->
+%% The subchannels which can take calls (connected and healthy), and the others.
+subchannels(#state{name = Name, published = Published}) ->
+    Healthy = [Id || #{id := Id, attributes := #{healthy := true}} <- Published],
     case egrpc_channel:describe(Name) of
         #{subchannels := Subs} ->
-            {Ready, Other} = lists:partition(fun(#{state := S}) -> S =:= ready end, Subs),
+            {Ready, Other} = lists:partition(
+                fun(#{id := Id, state := S}) -> S =:= ready andalso lists:member(Id, Healthy) end, Subs),
             {length(Ready), length(Other)};
         {error, _} ->
             {0, 0}

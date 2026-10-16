@@ -38,6 +38,8 @@
     member_add_remove/1,
     learner_member/1,
     leader_change/1,
+    leader_down/1,
+    partitioned_member/1,
     watch_many_watchers/1,
     watch_invalid_request/1,
     watch_recreate_same_name/1,
@@ -87,6 +89,8 @@ all() ->
         member_add_remove,
         learner_member,
         leader_change,
+        leader_down,
+        partitioned_member,
         watch_many_watchers,
         watch_invalid_request,
         watch_recreate_same_name,
@@ -118,7 +122,8 @@ init_per_testcase(Case, Config)
        Case =:= binary_cred; Case =:= secrets_not_exposed ->
     Config;
 init_per_testcase(Case, Config)
-  when Case =:= member_down; Case =:= member_add_remove; Case =:= learner_member ->
+  when Case =:= member_down; Case =:= member_add_remove; Case =:= learner_member;
+       Case =:= leader_down; Case =:= partitioned_member ->
     case docker_member(2379) of
         {ok, _} -> open_client(1000, Config);
         {error, Reason} -> {skip, {no_docker, Reason}}
@@ -964,13 +969,89 @@ member_id(Ctl, Name) ->
 %% `etcdctl' in the container of the leader, the client URL of the member is published on the host,
 %% so the container is the one which publishes the port.
 leader_ctl() ->
-    Channel = ?CLIENT,
-    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_stub:member_list(Channel, #{}),
-    LeaderId = leader(),
-    [#{clientURLs := [Url | _]}] = [M || #{'ID' := Id} = M <- Members, Id =:= LeaderId],
-    #{port := Port} = uri_string:parse(Url),
-    {ok, Container} = docker_member(Port),
+    {_Port, Container} = leader_member(),
     ["docker exec ", Container, " /usr/local/bin/etcdctl --user root:123456 "].
+
+%% The client port and the container of the leader.
+leader_member() ->
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_stub:member_list(?CLIENT, #{}),
+    LeaderId = leader(),
+    [Port] = [client_port(M) || #{'ID' := Id} = M <- Members, Id =:= LeaderId],
+    {ok, Container} = docker_member(Port),
+    {Port, Container}.
+
+client_port(#{clientURLs := [Url | _]}) ->
+    #{port := Port} = uri_string:parse(Url),
+    Port.
+
+%% The leader is stopped: the reads (with the retry of etcdgun, nothing of the test) are served by
+%% the others once one of them is the leader, within the deadline, and a write is not repeated.
+leader_down(_Config) ->
+    {_Port, Container} = leader_member(),
+    {0, _} = sh(["docker stop -t 1 ", Container]),
+    try
+        Opts = etcdgun_retry:opts(etcdgun_etcdserverpb_kv_stub, range, #{deadline => 20000}),
+        [{ok, _} = etcdgun_etcdserverpb_kv_stub:range(?CLIENT, #{key => key()}, Opts)
+         || _ <- lists:seq(1, 10)],
+        ok = wait_until(fun() -> actives() =:= 2 end, 60)
+    after
+        sh(["docker start ", Container])
+    end,
+    ok = wait_until(fun() -> actives() =:= 3 end, 120).
+
+%% A member which is cut off from the others, not from the client: the connection is fine and the
+%% server has no leader. A request to it fails (a write is not repeated), the reads are served by
+%% the others, and the member is not used until it is back.
+partitioned_member(_Config) ->
+    case sh(["docker image inspect alpine:3.22 >/dev/null"]) of
+        {0, _} -> ok;
+        {_, _} -> throw({skip, no_alpine_image})
+    end,
+    LeaderPort = element(1, leader_member()),
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_stub:member_list(?CLIENT, #{}),
+    Ports = [client_port(M) || M <- Members],
+    [Port | OtherPorts] = [P || P <- Ports, P =/= LeaderPort] ++ [LeaderPort],
+    Id = iolist_to_binary(["127.0.0.1:", integer_to_list(Port)]),
+    Cut = [{docker_container(Port), docker_container(P)} || P <- OtherPorts],
+    Routes = [{A, B} || {A, B} <- Cut] ++ [{B, A} || {A, B} <- Cut],
+    try
+        [route(add, From, To) || {From, To} <- Routes],
+        At = fun() -> #{attributes => #{etcdgun_target => Id}, retry => false, deadline => 3000} end,
+        %% the member says there is no leader, once it noticed
+        ok = wait_until(fun() ->
+            {error, {etcd_error, no_leader}} =:=
+                etcdgun_etcdserverpb_kv_stub:range(?CLIENT, #{key => key()}, At())
+        end, 30),
+        %% the connection is up
+        #{subchannels := Subs} = egrpc_channel:describe(?CLIENT),
+        ?assertMatch([_], [S || #{id := I, state := ready} = S <- Subs, I =:= Id]),
+        %% a write is not repeated: the error comes at once
+        {Time, Put} = timer:tc(fun() ->
+            etcdgun_etcdserverpb_kv_stub:put(?CLIENT, #{key => key(), value => <<"v">>}, At())
+        end),
+        ?assertMatch({error, {etcd_error, no_leader}}, Put),
+        ?assert(Time < 1000_000),
+        %% the reads are served by the others
+        Opts = etcdgun_retry:opts(etcdgun_etcdserverpb_kv_stub, range, #{deadline => 20000}),
+        [{ok, _} = etcdgun_etcdserverpb_kv_stub:range(?CLIENT, #{key => key()}, Opts)
+         || _ <- lists:seq(1, 30)],
+        %% and the member is not used
+        ok = wait_until(fun() -> actives() =:= 2 end, 60)
+    after
+        [catch route(del, From, To) || {From, To} <- Routes]
+    end,
+    ok = wait_until(fun() -> actives() =:= 3 end, 60).
+
+docker_container(Port) ->
+    {ok, Container} = docker_member(Port),
+    Container.
+
+%% The packets of the container `From' to the container `To' are dropped, in the network of `From'.
+route(Action, From, To) ->
+    {0, Ip} = sh(["docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' ", To]),
+    Verb = case Action of add -> "add"; del -> "del" end,
+    {0, _} = sh(["docker run --rm --net container:", From, " --cap-add NET_ADMIN alpine:3.22 ",
+                 "ip route ", Verb, " blackhole ", Ip, "/32"]).
 
 %% The member id of the leader, by the status of any member.
 leader() ->

@@ -31,12 +31,29 @@ call_credentials(#{service := Service, method := Path, info := Info}) ->
     %% The token is always accepted, even by the RPCs which do not require it, so it is sent to all
     %% of them except `Auth.Authenticate', which is how the token is obtained. When there is no
     %% token yet, e.g. the authentication is not enabled, nothing is sent.
-    case should_auth(Service, Path) andalso get_token(Info) of
-        {ok, Token} ->
+    Token = case should_auth(Service, Path) andalso get_token(Info) of
+        {ok, T} ->
             ?LOG_DEBUG("Authenticating RPC ~s", [Path]),
-            {ok, #{<<"token">> => Token}};
+            #{<<"token">> => T};
         _ ->
-            {ok, #{}}
+            #{}
+    end,
+    {ok, require_leader(Service, Token)}.
+
+%% A member which has no leader (it is cut off from the others, or an election is going on) makes a
+%% request wait until the server gives up, 7 seconds. With `hasleader' the member refuses it at
+%% once with "no leader" (`unavailable'), so it can be made again on another one: what
+%% `clientv3.WithRequireLeader' does.
+require_leader(Service, Metadata) ->
+    case is_etcd_service(Service) of
+        true -> Metadata#{<<"hasleader">> => <<"true">>};
+        false -> Metadata
+    end.
+
+is_etcd_service(Service) ->
+    case string:split(atom_to_list(Service), ".", all) of
+        [Package, _] -> lists:member(Package, ["etcdserverpb", "v3electionpb", "v3lockpb"]);
+        _ -> false
     end.
 
 %% Whether the RPC gets the token: the services of etcd, except `Auth.Authenticate'.
@@ -64,7 +81,8 @@ unary(Call, Req, Next) ->
         {error, {etcd_error, Reason}} = Res when Reason =:= user_empty;
                                                  Reason =:= auth_old_revision;
                                                  Reason =:= invalid_auth_token ->
-            case refresh_token(Call, Stale) of
+            case no_refresh(Call) orelse refresh_token(Call, Stale) of
+                true -> Res;
                 {ok, _} ->
                     ?LOG_DEBUG("Refreshed the token, retrying ~s", [egrpc_call:method(Call)]),
                     map_error(Next(Call, Req));
@@ -91,6 +109,10 @@ current_token(Call) ->
         _ -> undefined
     end.
 
+%% Set by the calls of the client while it starts: it is not there to refresh yet.
+no_refresh(Call) ->
+    maps:get(etcdgun_no_refresh, egrpc_call:attributes(Call), false).
+
 refresh_token(Call, Stale) ->
     case egrpc_call:info(Call) of
         #{client := Client} -> etcdgun_client:refresh_token(Client, Stale);
@@ -99,6 +121,13 @@ refresh_token(Call, Stale) ->
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
+
+call_credentials_test() ->
+    Info = fun(S, M) -> #{service => S, method => M, attempt => 0, info => #{}} end,
+    %% etcd: it has to have a leader; no token while there is none
+    ?assertEqual({ok, #{<<"hasleader">> => <<"true">>}},
+                 call_credentials(Info('etcdserverpb.KV', <<"/etcdserverpb.KV/Range">>))),
+    ?assertEqual({ok, #{}}, call_credentials(Info('grpc.health.v1.Health', <<"/grpc.health.v1.Health/Check">>))).
 
 %% Which RPCs get the token. The Lease RPCs are in, `LeaseRevoke' checks the permissions of the
 %% keys of the lease, and etcd 3.7 requires the token for all of them.
