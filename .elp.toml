@@ -1,0 +1,6 @@
+[eqwalizer]
+ignore_modules = [
+    "etcdgun_rpc_pb",
+    "etcdgun_v3election_pb",
+    "etcdgun_v3lock_pb",
+]

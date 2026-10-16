@@ -10,12 +10,16 @@ words = [
     "ifdef",
     "ipath",
     "keepalive",
+    "keepalives",
     "mgmt",
     "mvcc",
     "nofin",
     "retryings",
+    "subchannel",
+    "subchannels",
     "tref",
     "ttl",
+    "txn",
     "urlexist",
 ]
 ignore_paths = [".codebook.toml"]
