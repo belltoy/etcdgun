@@ -58,14 +58,14 @@ kv_and_members(Config) ->
     ?assertMatch(#{actives := 3, authenticated := true}, Info),
     #{members := Members} = Info,
     [?assertMatch(<<"https://", _/binary>>, Url) || #{clientURLs := [Url | _]} <- Members],
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     Key = key(),
-    {ok, _} = etcdgun_etcdserverpb_kv_client:put(Channel, #{key => Key, value => <<"tls">>}),
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:put(Channel, #{key => Key, value => <<"tls">>}),
     {ok, #{kvs := [#{value := <<"tls">>}]}} =
-        etcdgun_etcdserverpb_kv_client:range(Channel, #{key => Key}),
-    {ok, #{members := Listed}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+        etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => Key}),
+    {ok, #{members := Listed}} = etcdgun_etcdserverpb_cluster_stub:member_list(Channel, #{}),
     ?assertEqual(3, length(Listed)),
-    {ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}).
+    {ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_stub:check(Channel, #{}).
 
 %% The streaming calls, with the token, over TLS.
 watch_and_lease(Config) ->
@@ -76,20 +76,20 @@ watch_and_lease(Config) ->
         range_end => iolist_to_binary(etcdgun:prefix_range_end(Prefix))
     },
     {ok, _} = etcdgun:watch(?CLIENT, tls_watcher, etcdgun_ct_handler, self(), Req),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     Key = <<Prefix/binary, "/a">>,
-    {ok, _} = etcdgun_etcdserverpb_kv_client:put(Channel, #{key => Key, value => <<"1">>}),
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:put(Channel, #{key => Key, value => <<"1">>}),
     receive
         {watch_event, {watch_events, [#{kv := #{key := Key}}]}} -> ok
     after 5000 -> ct:fail(no_watch_events)
     end,
     ok = etcdgun:cancel_watch(?CLIENT, tls_watcher),
     {ok, #{'ID' := LeaseId}} =
-        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 3}),
+        etcdgun_etcdserverpb_lease_stub:lease_grant(Channel, #{'TTL' => 3}),
     {ok, _} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, true),
     timer:sleep(5000),
     {ok, #{'TTL' := TTL}} =
-        etcdgun_etcdserverpb_lease_client:lease_time_to_live(Channel, #{'ID' => LeaseId}),
+        etcdgun_etcdserverpb_lease_stub:lease_time_to_live(Channel, #{'ID' => LeaseId}),
     ?assert(TTL > 0),
     ok = etcdgun_lease_keepalive_sup:stop_child(?CLIENT, LeaseId).
 

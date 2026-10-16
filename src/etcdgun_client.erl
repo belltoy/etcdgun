@@ -1,6 +1,11 @@
-%% @doc Connect to all etcd servers in a cluster, implementing the clientv3-grpc1.23
-%% [https://etcd.io/docs/v3.5/learning/design-client/#clientv3-grpc123-balancer-overview
-%% Balancer Overview]
+%% @doc The client of an etcd cluster: one logical egrpc channel for the whole cluster.
+%%
+%% The channel is named after the client, so the generated stubs are called with the name
+%% (`etcdgun_etcdserverpb_kv_stub:range(my_client, Request)'). Its endpoints are the members of
+%% the cluster, found with `MemberList' and checked again now and then: the connections, the
+%% choice of the endpoint for every call and the reconnects are those of egrpc. This process owns
+%% the credentials and the token and keeps the endpoints up to date, it is not on the path of a
+%% request.
 
 -module(etcdgun_client).
 
@@ -19,7 +24,6 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    handle_continue/2,
     terminate/2,
     format_status/1
 ]).
@@ -28,7 +32,6 @@
     client_info/1,
     update_cred/3,
     unset_cred/1,
-    pick_channel/1,
     cached_token/1,
     normalize_cred/1,
     refresh_token/1,
@@ -50,13 +53,15 @@
 
 -record(state, {
     name :: atom(),
+    %% The endpoints which were given, where the client goes back to when the members can not
+    %% be found.
+    seeds :: [etcdgun:endpoint()],
+    %% The endpoints of the channel.
+    endpoints :: [etcdgun:endpoint()],
+    transport :: tcp | tls,
     members :: #{member_id() => member()},
-    actives :: [{member_id(), egrpc:channel(), MonitorRef ::reference()}],
-    connectings = [] :: [{member_id(), egrpc:channel(), MonitorRef ::reference()}],
-    retry_tref = undefined :: undefined | reference(),
     membership_tref = undefined :: undefined | reference(),
     membership_check_interval :: timeout(), %% 5 minutes
-    opts = #{} :: map(), %% Options (interceptors) used to open every channel
     token = undefined :: binary() | undefined,
     cred = undefined :: {binary(), binary()} | undefined,
     %% The token which is being refreshed, by a process of its own, so the client does not wait
@@ -71,7 +76,8 @@
 -define(REFRESH_BACKOFF, 1000).
 %% Longer than a refresh takes: `Authenticate' waits for 5 seconds for a message of the response.
 -define(REFRESH_CALL_TIMEOUT, 15000).
--define(RETRY_INTERVAL, 5000).
+%% How long to wait for the first endpoint to be connected.
+-define(CONNECT_TIMEOUT, 5000).
 -define(MEMBERSHIP_CHECK_INTERVAL, 300_000). % 5 minutes
 
 client_info(Client) ->
@@ -174,13 +180,6 @@ cached_token(Client) ->
         [] -> undefined
     end.
 
--spec pick_channel(etcdgun:client() | pid()) ->
-    {ok, egrpc:channel()} |
-    {error, no_available_connection | term()}.
-pick_channel(Client) ->
-    %% eqwalizer:ignore
-    gen_server:call(Client, pick_channel).
-
 -spec sync_membership(etcdgun:client() | pid(), [etcdgun_rpc_pb:'etcdserverpb.Member'()]) -> ok.
 sync_membership(Client, Members) ->
     gen_server:cast(Client, {sync_membership, Members}).
@@ -231,49 +230,60 @@ do_init(Client, Endpoints, Opts0, Cred, Transport) ->
             infinity -> infinity;
             _ -> ?MEMBERSHIP_CHECK_INTERVAL
         end,
-    %% The options of every channel. The transport of the members is the scheme of their client
-    %% URLs, and `Transport' is the one of the endpoints which are given to connect to.
-    Opts = (maps:with([interceptors, gun_opts], Opts0))#{
-        call_credentials => fun etcdgun_interceptor_auth:call_credentials/1
+    %% The authentication is the first interceptor, the ones of the user see the requests as they
+    %% are made.
+    ChannelOpts = with_transport(#{
+        target => Endpoints,
+        retry => etcdgun_retry:policy(),
+        call_credentials => fun etcdgun_interceptor_auth:call_credentials/1,
+        interceptors => [etcdgun_interceptor_auth | maps:get(interceptors, Opts0, [])],
+        gun_opts => maps:get(gun_opts, Opts0, #{}),
+        info => #{client => Client}
+    }, Transport),
+    %% A channel which was left by a client which was killed.
+    _ = egrpc_channel:stop(Client),
+    ok = egrpc_channel:start(Client, ChannelOpts),
+    State0 = #state{
+        name = Client,
+        seeds = Endpoints,
+        endpoints = Endpoints,
+        transport = Transport,
+        members = #{},
+        membership_check_interval = MembershipCheckInterval,
+        cred = Cred
     },
     maybe
-        %% Authenticate first, the RPCs of getting the members and checking them require the token
-        %% in etcd 3.6 and 3.7 when authentication is enabled.
-        {ok, Members, Token} ?=
-            get_member_list(Client, shuffle(Endpoints), Cred, with_transport(Opts, Transport)),
-        {ok, Actives, Errors} ?= open_and_wait_members(Client, Members, Token, Opts, [], []),
-        % {ok, _Pid} ?= etcdgun_membership:start_link(Client),
-        ?LOG_INFO(#{
-            msg =>"Connected to etcd",
-            members => Members,
-            actives => length(Actives),
-            retryings => length(Errors)
-        }),
-        State = #state{
-            name = Client,
-            %% elp:ignore W0036
-            members = maps:from_list([{Id, M} || #{'ID' := Id} = M <- Members]),
-            actives = shuffle(Actives),
-            membership_check_interval = MembershipCheckInterval,
-            opts = Opts,
-            membership_tref = undefined,
-            token = Token,
-            cred = Cred
-        },
-        {ok, start_membership_timer(start_retry_timer(publish_token(State)))}
+        ok ?= wait_ready(Client),
+        %% Authenticate first, the RPCs of getting the members require the token in etcd 3.6 and
+        %% 3.7 when authentication is enabled.
+        {ok, Token} ?= authenticate_bootstrap(Client, Cred),
+        State1 = publish_token(State0#state{token = Token}),
+        {ok, Members} ?= get_member_list(Client, Token),
+        ok ?= check_leader(Client, Token),
+        State2 = apply_members(Members, State1),
+        ?LOG_INFO(#{msg => "Connected to etcd", members => Members}),
+        {ok, start_membership_timer(State2)}
     else
         {error, Reason} ->
-            ?LOG_ERROR("Failed to connect to etcd endpoints: ~p, reason: ~p",
-                       [Endpoints, Reason]),
+            ?LOG_ERROR("Failed to connect to etcd endpoints: ~p, reason: ~p", [Endpoints, Reason]),
+            _ = egrpc_channel:stop(Client),
+            ets:delete(?TOKEN_TABLE, Client),
             {stop, Reason}
     end.
 
+wait_ready(Client) ->
+    case egrpc_channel:await_ready(Client, ?CONNECT_TIMEOUT) of
+        ok -> ok;
+        {error, timeout} -> {error, no_available_endpoints}
+    end.
+
 handle_call(client_info, _From, State) ->
+    {Actives, Connectings} = subchannels(State#state.name),
     Reply = #{
         name => State#state.name,
         pid => self(),
-        actives => length(State#state.actives),
-        connectings => length(State#state.connectings),
+        actives => Actives,
+        connectings => Connectings,
         members => maps:values(State#state.members),
         %% Neither the password nor the token, this is what `etcdgun:clients/0' returns and what
         %% ends up in logs.
@@ -304,19 +314,12 @@ handle_call({refresh_token, _Stale}, From, #state{refresh_failed = {Until, Error
 handle_call({refresh_token, _Stale}, From, State) ->
     {noreply, start_refresh(From, State)};
 
-handle_call(pick_channel, _From, #state{actives = []} = State) ->
-    {reply, {error, no_available_connection}, State};
-
-handle_call(pick_channel, _From, #state{actives = [{_M, Channel, _MRef} = P | Rest]} = State) ->
-    %% The token is not in the channel, the call credentials read the current one of the client.
-    {reply, {ok, Channel}, State#state{actives = Rest ++ [P]}};
-
 handle_call({update_cred, undefined}, _From, #state{cred = _Cred0} = State) ->
     ?LOG_INFO("Unset credentials for client ~p", [State#state.name]),
     {reply, ok, publish_token(State#state{cred = undefined, token = undefined,
                                           refresh_failed = undefined})};
 handle_call({update_cred, {Username, _Password} = Cred}, _From, #state{cred = _Cred0} = State) ->
-    case auth(State#state.actives, Cred) of
+    case authenticate(State#state.name, Cred) of
         {ok, NewToken} ->
             ?LOG_INFO("Updated credentials for client ~p: ~p", [State#state.name, Username]),
             {reply, ok, publish_token(State#state{cred = Cred, token = NewToken,
@@ -336,7 +339,7 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unsupported_call}, State}.
 
 handle_cast({sync_membership, NewMembers}, #state{} = State) ->
-    {noreply, State, {continue, {do_sync_membership, NewMembers}}};
+    {noreply, apply_members(NewMembers, State)};
 
 handle_cast(_Msg, State) ->
     {noreply, State}.
@@ -346,24 +349,31 @@ handle_info({timeout, TRef, check_membership}, #state{membership_tref = TRef} = 
     Self = self(),
     spawn(
         fun() ->
-            maybe
-                {ok, Channel} ?= pick_channel(Self),
-                {ok, Members} ?= do_get_member_list(Channel),
-                Self ! {sync_membership, Members}
-            else
+            case get_member_list(Client, undefined) of
+                {ok, Members} ->
+                    Self ! {sync_membership, Members};
                 {error, Reason} ->
-                    ?LOG_WARNING("Failed to check membership for client ~p: ~p", [Client, Reason])
+                    ?LOG_WARNING("Failed to check membership for client ~p: ~p", [Client, Reason]),
+                    Self ! {sync_failed, Reason}
             end
         end),
     {noreply, start_membership_timer(State#state{membership_tref = undefined})};
-handle_info({timeout, TRef, retry}, #state{retry_tref = TRef} = State) ->
-    {noreply, State#state{retry_tref = undefined}, {continue, do_retry}};
 
-handle_info({gun_up, GunPid, http2}, State) ->
-    %% TODO: check if the connected node is healthy
-    {noreply, handle_gun_up(GunPid, State)};
-handle_info({gun_down, GunPid, http2, Reason, _Streams}, State) ->
-    {noreply, handle_gun_down(GunPid, Reason, State)};
+handle_info({sync_membership, NewMembers}, State) ->
+    {noreply, apply_members(NewMembers, State)};
+
+%% No member can be found and no endpoint is connected: the members may have all moved, the
+%% endpoints which were given are tried again as well.
+handle_info({sync_failed, _Reason}, #state{name = Client, seeds = Seeds, endpoints = Endpoints} = State) ->
+    case egrpc_channel:connectivity(Client) of
+        ready ->
+            {noreply, State};
+        _ ->
+            All = lists:usort(Seeds ++ Endpoints),
+            ok = egrpc_channel:update_endpoints(Client, All),
+            {noreply, State#state{endpoints = All}}
+    end;
+
 handle_info({refreshed, Pid, Result}, #state{refreshing = #refresh{pid = Pid} = Refresh} = State) ->
     erlang:demonitor(Refresh#refresh.mref, [flush]),
     {noreply, finish_refresh(Result, State)};
@@ -371,74 +381,10 @@ handle_info({'DOWN', MRef, process, Pid, Reason},
             #state{refreshing = #refresh{pid = Pid, mref = MRef}} = State) ->
     ?LOG_ERROR("The refresh of the token of client ~p crashed: ~p", [State#state.name, Reason]),
     {noreply, finish_refresh({error, {refresh_crashed, Reason}}, State)};
-handle_info({'DOWN', MRef, process, GunPid, Reason}, State) ->
-    erlang:demonitor(MRef, [flush]),
-    {noreply, handle_gun_down(GunPid, Reason, State)};
-
-handle_info({token_renewed, Token}, State) ->
-    {noreply, publish_token(State#state{token = Token})};
-
-handle_info({check, Result, Elem}, State) ->
-    {noreply, handle_check_result(Result, Elem, State)};
-
-handle_info({sync_membership, NewMembers}, State) ->
-    {noreply, State, {continue, {do_sync_membership, NewMembers}}};
 
 handle_info(Info, State) ->
     ?LOG_WARNING("Received unexpected info message: ~p", [Info]),
     {noreply, State}.
-
-handle_continue({do_sync_membership, NewMembers}, #state{members = OldMembers} = State) ->
-    ?LOG_DEBUG("Syncing membership for client ~p with members: ~p",
-               [State#state.name, NewMembers]),
-    %% Remove channels that are no longer in the membership
-    %% Add channels for new members
-    {Unchanged, ToRemoves} = lists:partition(
-        fun({Id0, #{clientURLs := Urls0} = _M}) ->
-                lists:any(fun(#{'ID' := Id, clientURLs := Urls}) ->
-                                  Id0 =:= Id andalso Urls0 =:= Urls
-                          end, NewMembers)
-        end, maps:to_list(OldMembers)),
-    ToRemovesMap = maps:from_list(ToRemoves),
-    Unchanged1 = maps:from_list(Unchanged),
-    %% elp:ignore W0036
-    NewMembersMap = maps:from_list([{Id, M} || #{'ID' := Id} = M <- NewMembers]),
-    ToAdds = maps:without(maps:keys(Unchanged1), NewMembersMap),
-
-    {ToRemoveActives, Actives1} = lists:partition(
-        fun({Id, _Channel, _MRef}) -> is_map_key(Id, ToRemovesMap) end, State#state.actives),
-    {ToRemoveConnectings, Connectings1} = lists:partition(
-        fun({Id, _Channel, _MRef}) -> is_map_key(Id, ToRemovesMap) end, State#state.connectings),
-
-    length(ToRemoves) > 0 andalso ?LOG_INFO("Removing etcd members: ~p",
-                                              [maps:values(ToRemovesMap)]),
-    maps:size(ToAdds) > 0 andalso ?LOG_INFO("Adding etcd members: ~p", [maps:values(ToAdds)]),
-
-    [egrpc_stub:close(Channel) || {_, Channel, _} <- ToRemoveActives ++ ToRemoveConnectings],
-
-    NewState = State#state{
-        members = NewMembersMap,
-        actives = Actives1,
-        connectings = Connectings1
-    },
-    {noreply, NewState, {continue, do_retry}};
-
-handle_continue(do_retry, #state{connectings = OldConnectings} = State) ->
-    cancel_retry_timer(State),
-    Retries0 = maps:keys(State#state.members) -- [Id || {Id, _, _MRef} <- State#state.actives],
-    Retries = Retries0 -- [Id || {Id, _, _MRef} <- State#state.connectings],
-
-    Connectings =
-        case length(Retries) > 0 of
-            true ->
-                ?LOG_INFO("Retrying to connect to etcd members..."),
-                RetriesMembers = maps:values(maps:with(Retries, State#state.members)),
-                open_members(State#state.name, RetriesMembers, State#state.opts, []);
-            false ->
-                []
-        end,
-    State1 = State#state{connectings = OldConnectings ++ Connectings},
-    {noreply, start_retry_timer(State1)}.
 
 %% The state is in the crash reports and the output of `sys:get_status/1', without the secrets.
 format_status(#{state := #state{} = State} = Status) ->
@@ -449,10 +395,10 @@ format_status(Status) ->
 redact(undefined) -> undefined;
 redact(_Secret) -> '<redacted>'.
 
-terminate(_Reason, #state{actives = Actives, connectings = Connectings} = State) ->
+terminate(_Reason, #state{name = Name}) ->
     ?LOG_NOTICE("Terminating etcdgun client, reason: ~p", [_Reason]),
-    [ensure_close(Conn) || {_Id, _Channel, _MRef} = Conn <- Actives ++ Connectings],
-    ets:delete(?TOKEN_TABLE, State#state.name),
+    _ = egrpc_channel:stop(Name),
+    ets:delete(?TOKEN_TABLE, Name),
     ok.
 
 %%-------------------------------------------------------------------
@@ -466,9 +412,9 @@ publish_token(#state{name = Name, token = Token} = State) ->
     State.
 
 %% Authenticates in a process of its own, the waiters get the result from `finish_refresh/2'.
-start_refresh(From, #state{cred = Cred, actives = Actives} = State) ->
+start_refresh(From, #state{name = Name, cred = Cred} = State) ->
     Self = self(),
-    {Pid, MRef} = spawn_monitor(fun() -> Self ! {refreshed, self(), auth(Actives, Cred)} end),
+    {Pid, MRef} = spawn_monitor(fun() -> Self ! {refreshed, self(), authenticate(Name, Cred)} end),
     State#state{refreshing = #refresh{pid = Pid, mref = MRef, cred = Cred, waiters = [From]}}.
 
 finish_refresh(Result, #state{refreshing = #refresh{cred = Cred, waiters = Waiters}} = State0) ->
@@ -493,17 +439,6 @@ refresh_result({error, Reason}, _Cred, State) ->
     Until = erlang:monotonic_time(millisecond) + ?REFRESH_BACKOFF,
     {{error, Reason}, State#state{refresh_failed = {Until, Reason}}}.
 
-ensure_close({_Id, Channel, MRef}) ->
-    erlang:demonitor(MRef, [flush]),
-    egrpc_stub:close(Channel).
-
-shuffle(List) ->
-    [X || {_, X} <- lists:sort([{rand:uniform(), N} || N <- List])].
-
-start_retry_timer(State) ->
-    TRef = erlang:start_timer(?RETRY_INTERVAL, self(), retry),
-    State#state{retry_tref = TRef}.
-
 %% `infinity' first: as a term, the atom is greater than any integer.
 start_membership_timer(#state{membership_check_interval = infinity} = State) ->
     State;
@@ -514,69 +449,47 @@ start_membership_timer(#state{membership_check_interval = Interval} = State)
     TRef = erlang:start_timer(Interval, self(), check_membership),
     State#state{membership_tref = TRef}.
 
-cancel_retry_timer(#state{retry_tref = undefined}) -> ok;
-cancel_retry_timer(#state{retry_tref = TRef}) -> erlang:cancel_timer(TRef).
+authenticate(_Client, undefined) -> {ok, undefined};
+authenticate(Client, {Username, Password}) ->
+    maybe
+        Req = #{name => Username, password => Password},
+        {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_stub:authenticate(Client, Req),
+        {ok, Token}
+    end.
 
-%% Authenticate with the credentials and get the member list, return the token too.
-get_member_list(_Client, [], _Cred, _Opts) -> {error, no_available_endpoints};
-get_member_list(Client, [{Host, Port} | Rest], Cred, Opts) ->
-    with_channel(Host, Port, Opts, fun(Channel) ->
-        case authenticate_bootstrap(Channel, Cred) of
-            {ok, Token} ->
-                case do_get_member_list(with_token(Channel, Token)) of
-                    {ok, []} ->
-                        ?LOG_WARNING("No members found in etcd cluster at ~s:~p", [Host, Port]),
-                        get_member_list(Client, Rest, Cred, Opts);
-                    {ok, Members} -> {ok, Members, Token};
-                    {error, Reason} ->
-                        case is_auth_required(Token, Reason) of
-                            true ->
-                                {error, no_credentials};
-                            false ->
-                                ?LOG_WARNING("Failed to connect to etcd endpoint: ~s:~p, "
-                                             "reason: ~p", [Host, Port, Reason]),
-                                get_member_list(Client, Rest, Cred, Opts)
-                        end
-                end;
-            {error, {etcd_error, _}} = Error ->
-                %% Rejected by the server, e.g. wrong password, other endpoints will do the same.
-                Error;
-            {error, Reason} ->
-                ?LOG_WARNING("Failed to authenticate on etcd endpoint: ~s:~p, reason: ~p",
-                             [Host, Port, Reason]),
-                get_member_list(Client, Rest, Cred, Opts)
-        end
-    end).
-
-authenticate_bootstrap(Channel, Cred) ->
-    case authenticate(Channel, Cred) of
+authenticate_bootstrap(Client, Cred) ->
+    case authenticate(Client, Cred) of
         {error, {etcd_error, auth_not_enabled}} ->
             ?LOG_WARNING("Authentication is not enabled on the etcd server, skipping"),
             {ok, undefined};
         Result -> Result
     end.
 
-%% Put the token into the channel info for a channel which is not the one of the client yet, the
-%% call credentials send it with the requests.
-with_token(Channel, undefined) -> Channel;
-with_token(Channel, Token) ->
-    OldInfo = egrpc_stub:info(Channel, #{}),
-    %% eqwalizer:ignore
-    NewInfo = OldInfo#{token => Token},
-    egrpc_stub:derive(Channel, #{info => NewInfo}).
-
-with_channel(Host, Port, Opts, Fun) ->
-    maybe
-        {ok, Channel} ?= open_and_wait(Host, Port, Opts),
-        Result = Fun(Channel),
-        egrpc_stub:close(Channel),
-        Result
+%% The members, `Token' is the one the request is made with: none and a server which requires one
+%% is that there are no credentials.
+get_member_list(Client, Token) ->
+    Opts = etcdgun_retry:opts(etcdgun_etcdserverpb_cluster_stub, member_list),
+    case etcdgun_etcdserverpb_cluster_stub:member_list(Client, #{}, Opts) of
+        {ok, #{members := Members}} -> {ok, usable_members(Members)};
+        {error, Reason} ->
+            case is_auth_required(Token, Reason) of
+                true -> {error, no_credentials};
+                false -> {error, Reason}
+            end
     end.
 
-do_get_member_list(Channel) ->
-    maybe
-        {ok, #{members := Members}} ?= etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
-        {ok, usable_members(Members)}
+%% Etcd 3.6 and later require the token for the status of a member, 3.5 only for the keys, and a
+%% cluster without a leader can not serve the requests: both are better told at the start.
+check_leader(Client, Token) ->
+    Opts = etcdgun_retry:opts(etcdgun_etcdserverpb_maintenance_stub, status),
+    case etcdgun_etcdserverpb_maintenance_stub:status(Client, #{}, Opts) of
+        {ok, #{leader := 0}} -> {error, no_leader};
+        {ok, _} -> ok;
+        {error, Reason} ->
+            case is_auth_required(Token, Reason) of
+                true -> {error, no_credentials};
+                false -> {error, Reason}
+            end
     end.
 
 %% Learners do not serve normal requests, and members that were added but not started yet have no
@@ -587,72 +500,52 @@ usable_members(Members) ->
 is_learner(#{isLearner := IsLearner}) -> IsLearner =:= true orelse IsLearner =:= 1;
 is_learner(#{}) -> false.
 
-open_and_wait_members(_Client, [], _Token, _Opts, [], _Errors) ->
-    {error, no_available_endpoints};
-open_and_wait_members(_Client, [], _Token, _Opts, Success, Errors) -> {ok, Success, Errors};
-open_and_wait_members(Client, [#{'ID' := Id} = Member | Rest], Token, Opts, Success, Errors) ->
-    maybe
-        #{clientURLs := [ClientUrl | _]} = Member,
-        {ok, Host, Port, Transport} ?= parse_client_url(ClientUrl),
-        ChannelOpts = (with_transport(Opts, Transport))#{info => #{client => Client}},
-        {ok, Channel} ?= open_and_wait(Host, Port, ChannelOpts),
-        ok ?= close_on_error(Channel, check_endpoint(with_token(Channel, Token))),
-        GunPid = egrpc_stub:conn_pid(Channel),
-        MRef = erlang:monitor(process, GunPid),
-        open_and_wait_members(Client, Rest, Token, Opts, [{Id, Channel, MRef} | Success], Errors)
-    else
-        {error, Reason} ->
-            case is_auth_required(Token, Reason) of
-                true ->
-                    %% The other members are the same, give up.
-                    [ensure_close(Elem) || Elem <- Success],
-                    {error, no_credentials};
-                false ->
-                    ?LOG_WARNING(#{msg =>"Failed to connect to etcd member",
-                                   member => Member,
-                                   reason => Reason}),
-                    open_and_wait_members(Client, Rest, Token, Opts, Success, [Id | Errors])
-            end
-    end.
-
-close_on_error(_Channel, ok) -> ok;
-close_on_error(Channel, {error, _} = Error) ->
-    egrpc_stub:close(Channel),
-    Error.
-
 %% The server requires the token, but there is no one, i.e. no credentials configured.
 is_auth_required(undefined, {grpc_error, _, _} = Reason) ->
     is_auth_required(undefined, etcdgun_error:from_grpc_error(Reason));
 is_auth_required(undefined, Reason) -> Reason =:= {etcd_error, user_empty};
 is_auth_required(_Token, _Reason) -> false.
 
-open_and_wait(Host, Port, Opts) ->
-    maybe
-        {ok, Channel} ?= egrpc_stub:open(Host, Port, Opts#{}),
-        egrpc_stub:await_up(Channel)
+%% The members are the endpoints of the channel. Nothing is changed when there are none (the
+%% answer of a cluster which is starting, ...), nor when they are the same.
+apply_members([], State) ->
+    State;
+apply_members(Members, #state{name = Name, transport = Transport, endpoints = Old} = State) ->
+    Endpoints = member_endpoints(Members, Transport),
+    case Endpoints of
+        [] ->
+            ?LOG_WARNING("No member with a client URL of the transport ~p: ~p", [Transport, Members]),
+            State;
+        Old ->
+            State#state{members = members_map(Members)};
+        _ ->
+            ?LOG_INFO("Endpoints of etcd members: ~p, were ~p", [Endpoints, Old]),
+            ok = egrpc_channel:update_endpoints(Name, Endpoints),
+            State#state{members = members_map(Members), endpoints = Endpoints}
     end.
 
-open_members(_Client, [], _Opts, Result) -> Result;
-open_members(Client, [#{'ID' := Id} = Member | Rest], Opts, Success) ->
-    #{clientURLs := [ClientUrl | _]} = Member,
-    maybe
-        {ok, Host, Port, Transport} ?= parse_client_url(ClientUrl),
-        ChannelOpts = (with_transport(Opts, Transport))#{info => #{client => Client}},
-        {ok, Channel} ?= egrpc_stub:open(Host, Port, ChannelOpts),
-        MRef = erlang:monitor(process, egrpc_stub:conn_pid(Channel)),
-        open_members(Client, Rest, Opts, [{Id, Channel, MRef} | Success])
+%% elp:ignore W0036
+members_map(Members) -> maps:from_list([{Id, M} || #{'ID' := Id} = M <- Members]).
+
+%% The first client URL of every member. The transport is a setting of the channel, so a member
+%% which is at the other one is not connected to.
+member_endpoints(Members, Transport) ->
+    lists:usort(lists:flatmap(fun(#{clientURLs := Urls}) -> member_endpoint(Urls, Transport) end, Members)).
+
+member_endpoint(Urls, Transport) ->
+    case [{Host, Port} || Url <- Urls, {ok, Host, Port, T} <- [parse_client_url(Url)], T =:= Transport] of
+        [Endpoint | _] -> [Endpoint];
+        [] -> []
     end.
 
-auth([], _Cred) -> {error, no_available_connection};
-auth([{_MemberId, Channel, _MRef} | _], Cred) ->
-    authenticate(Channel, Cred).
-
-authenticate(_Channel, undefined) -> {ok, undefined};
-authenticate(Channel, {Username, Password}) ->
-    maybe
-        Req = #{name => Username, password => Password},
-        {ok, #{token := Token}} ?= etcdgun_etcdserverpb_auth_client:authenticate(Channel, Req),
-        {ok, Token}
+%% The subchannels which can take calls, and the others.
+subchannels(Name) ->
+    case egrpc_channel:describe(Name) of
+        #{subchannels := Subs} ->
+            {Ready, Other} = lists:partition(fun(#{state := S}) -> S =:= ready end, Subs),
+            {length(Ready), length(Other)};
+        {error, _} ->
+            {0, 0}
     end.
 
 scheme_transport("http") -> {ok, tcp};
@@ -676,112 +569,6 @@ parse_client_url(ClientUrl) ->
     else
         _ -> {error, invalid_client_url}
     end.
-
-handle_check_result(Result, {MemberId, Channel, MRef} = Elem,
-                    #state{connectings = Connectings} = State) ->
-    maybe
-        {value, {MemberId, Channel, MRef}, Rest} ?= lists:keytake(MemberId, 1, Connectings),
-        State1 = State#state{connectings = Rest},
-        {ok, _} ?= {Result, State1},
-        ?LOG_INFO("Connection established for etcd member (~s) ~s:~p",
-                  [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel)]),
-        State1#state{actives = [Elem | State#state.actives]}
-    else
-        {{error, Reason}, State2} ->
-            ?LOG_WARNING("Failed to check endpoint for member (~s) ~s:~p, reason: ~p",
-                         [hex(MemberId), egrpc_stub:host(Channel), egrpc_stub:port(Channel),
-                          Reason]),
-            %% It is not in any list anymore, so close it, or the connection is leaked and
-            %% a new one is opened on the next retry.
-            ensure_close(Elem),
-            State2;
-        false ->
-            ?LOG_WARNING("Received check result for unknown connection: ~p", [Elem]),
-            State
-    end.
-
-handle_gun_up(GunPid, #state{connectings = Connectings} = State) ->
-    case lists:search(fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end, Connectings) of
-        {value, {_MemberId, Channel, _MRef} = Elem} ->
-            Self = self(),
-            #state{token = Token, cred = Cred} = State,
-            spawn(fun() -> Self ! {check, check_connecting(Self, Channel, Token, Cred), Elem} end),
-            State;
-        false ->
-            ?LOG_WARNING("Received gun_up for unknown connection: ~p", [GunPid]),
-            State
-    end.
-
-handle_gun_down(GunPid, Reason, #state{actives = Actives, connectings = Connectings} = State) ->
-    IsGun = fun({_M, C, _MRef}) -> egrpc_stub:conn_pid(C) =:= GunPid end,
-    %% A connecting one may be down too, e.g. the member is down and gun gives up connecting.
-    %% Drop it, or it stays in `connectings' and the member is never retried.
-    case {lists:search(IsGun, Actives), lists:search(IsGun, Connectings)} of
-        {{value, {_MemberId, Channel, _MRef} = Elem}, _} ->
-            ?LOG_WARNING("Connection down for member ~s:~p, reason: ~p",
-                         [egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
-            ensure_close(Elem),
-            %% eqwalizer:ignore
-            State#state{actives = lists:delete(Elem, Actives)};
-        {false, {value, {_MemberId, Channel, _MRef} = Elem}} ->
-            ?LOG_WARNING("Failed to connect to member ~s:~p, reason: ~p, will retry",
-                         [egrpc_stub:host(Channel), egrpc_stub:port(Channel), Reason]),
-            ensure_close(Elem),
-            %% eqwalizer:ignore
-            State#state{connectings = lists:delete(Elem, Connectings)};
-        {false, false} ->
-            State
-    end.
-
-%% Check a connecting channel with the token. If it fails, the token may be invalid, e.g. the member
-%% was restarted and lost the token. Refreshing the token through the active channels does not work
-%% when this is the only member, so authenticate on this channel and check again.
-check_connecting(Client, Channel, Token, Cred) ->
-    case check_endpoint(with_token(Channel, Token)) of
-        {error, _} = Error when Cred =/= undefined ->
-            maybe
-                {ok, NewToken} ?= authenticate(Channel, Cred),
-                ok ?= check_endpoint(with_token(Channel, NewToken)),
-                Client ! {token_renewed, NewToken},
-                ok
-            else
-                _ -> Error
-            end;
-        Result -> Result
-    end.
-
-check_endpoint(Channel) ->
-    maybe
-        ok ?= check_health(Channel),
-        ok ?= check_leader(Channel),
-        ok
-    end.
-
-check_health(Channel) ->
-    case egrpc_grpc_health_v1_health_client:check(Channel, #{}) of
-        {ok, #{status := 'SERVING'}} -> ok;
-        {ok, #{status := 1}} -> ok;
-        {ok, #{status := 'UNKNOWN'}} -> ok;
-        {ok, #{status := 0}} -> ok;
-        {ok, #{status := Status}} -> {error, {unhealthy, Status}};
-        {error, Reason} -> {error, Reason}
-    end.
-
-check_leader(Channel) ->
-    case etcdgun_etcdserverpb_maintenance_client:status(Channel, #{}) of
-        {ok, #{leader := 0}} -> {error, no_leader};
-        {ok, #{leader := LeaderId, errors := Errors}} when LeaderId > 0 ->
-            case Errors of
-                [] -> ok;
-                _ ->
-                    ?LOG_WARNING("Errors reported by etcd server: ~s", [lists:join("; ", Errors)])
-            end,
-            ok;
-        {error, Reason} -> {error, Reason}
-    end.
-
-hex(I) when is_integer(I) ->
-    binary:encode_hex(<<I:64>>, lowercase).
 
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
@@ -851,6 +638,15 @@ format_status_test() ->
     ?assertMatch(#{state := #state{cred = undefined, token = undefined}},
                  format_status(#{state => NoCred})),
     ?assertEqual(#{reason => x}, format_status(#{reason => x})).
+
+member_endpoints_test() ->
+    M = fun(Id, Urls) -> #{'ID' => Id, clientURLs => Urls} end,
+    Members = [M(1, [<<"http://127.0.0.1:2379">>]), M(2, [<<"https://h:2379">>, <<"http://h:2479">>]),
+               M(3, [<<"https://h:2579">>])],
+    %% the transport is the one of the channel, the first URL of it is the endpoint
+    ?assertEqual([{"127.0.0.1", 2379}, {"h", 2479}], member_endpoints(Members, tcp)),
+    ?assertEqual([{"h", 2379}, {"h", 2579}], member_endpoints(Members, tls)),
+    ?assertEqual([], member_endpoints([M(4, [<<"unix://x">>])], tcp)).
 
 parse_client_url_test() ->
     ?assertEqual({ok, "127.0.0.1", 2379, tcp}, parse_client_url(<<"http://127.0.0.1:2379">>)),

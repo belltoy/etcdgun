@@ -1,9 +1,8 @@
-%% @doc This module handles authentication for etcd gRPC requests: the call credentials which add
-%% the token to the requests, and an interceptor which refreshes the token when it expires.
+%% @doc The authentication of etcd gRPC requests: the call credentials which add the token to
+%% every attempt, and an interceptor which refreshes the token when it is refused and maps the
+%% errors of the server to `etcd_error' (see `etcdgun_error').
 %%
-%% See `call_credentials/1' and `refresh_token/4' functions for implementation details.
-%%
-%% See also `t:egrpc_stub:unary_interceptor/0' for the type of gRPC unary interceptor.
+%% Both are installed by etcdgun on every client, they are not options.
 -module(etcdgun_interceptor_auth).
 
 -feature(maybe_expr, enable).
@@ -12,15 +11,13 @@
 
 -export([
     call_credentials/1,
-    refresh_token/4
+    unary/3
 ]).
 
-%% @doc The call credentials of etcdgun channels, see `t:egrpc_stub:call_credentials/0'.
+%% @doc The call credentials of etcdgun channels, see `m:egrpc_credentials'.
 %%
-%% It adds the token to every call, streaming calls included.
-call_credentials(Stream) ->
-    Service = egrpc_stream:grpc_service(Stream),
-    Method = egrpc_stream:grpc_method(Stream),
+%% It adds the token to every attempt of a unary call and to every stream.
+call_credentials(#{service := Service, method := Path, info := Info}) ->
     %% Which RPCs require the token when authentication is enabled depends on the etcd version.
     %% Without a token, the RPC fails with "etcdserver: user name is empty" where `token' is shown
     %% (checked against etcd 3.5.10, 3.6.5 and 3.7.0):
@@ -34,70 +31,59 @@ call_credentials(Stream) ->
     %% The token is always accepted, even by the RPCs which do not require it, so it is sent to all
     %% of them except `Auth.Authenticate', which is how the token is obtained. When there is no
     %% token yet, e.g. the authentication is not enabled, nothing is sent.
-    case should_auth(Service, Method) andalso get_token(Stream) of
+    case should_auth(Service, Path) andalso get_token(Info) of
         {ok, Token} ->
-            ?LOG_DEBUG("Authenticating RPC ~s.~s", [Service, Method]),
+            ?LOG_DEBUG("Authenticating RPC ~s", [Path]),
             {ok, #{<<"token">> => Token}};
         _ ->
             {ok, #{}}
     end.
 
 %% Whether the RPC gets the token: the services of etcd, except `Auth.Authenticate'.
-should_auth(Service, Method) ->
-    case {string:split(atom_to_list(Service), ".", all), Method} of
-        {["etcdserverpb", "Auth"], 'Authenticate'} -> false;
+should_auth(Service, Path) ->
+    case {string:split(atom_to_list(Service), ".", all), Path} of
+        {["etcdserverpb", "Auth"], <<"/etcdserverpb.Auth/Authenticate">>} -> false;
         {["etcdserverpb", _], _} -> true;
         {["v3electionpb", _], _} -> true;
         {["v3lockpb", _], _} -> true;
         {_, _} -> false
     end.
 
-%% The token of the channel info is for the channels which are not opened by a client yet, e.g.
-%% while bootstrapping, otherwise the current one of the client.
-get_token(Stream) ->
-    Channel = egrpc_stream:channel(Stream),
-    case egrpc_stub:info(Channel) of
-        #{token := Token} -> {ok, Token};
-        #{client := Client} -> etcdgun_client:cached_token(Client);
-        _ -> undefined
-    end.
+get_token(#{client := Client}) -> etcdgun_client:cached_token(Client);
+get_token(_) -> undefined.
 
-%% TODO: This is an unary interceptor for authentication refresh.
-%% streaming authentication refresh is not implemented yet.
-refresh_token(Stream, Req, Opts, Next) ->
-    ?LOG_DEBUG("Refresh token interceptor for RPC ~s.~s",
-              [egrpc_stream:grpc_service(Stream), egrpc_stream:grpc_method(Stream)]),
-    %% The token the request is sent with, before it is: when it is refused and the current one is
-    %% not it anymore, the token was refreshed by someone else, and there is nothing to refresh.
-    Stale = stale_token(Stream),
-    Res = case Next(Stream, Req, Opts) of
-              {ok, _} = Ok -> Ok;
-              {error, {grpc_error, _, _} = GrpcError} ->
-                  {error, etcdgun_error:from_grpc_error(GrpcError)};
-              {error, _} = Err -> Err
-          end,
-
-    case Res of
-        {error, {etcd_error, Reason}} when Reason =:= user_empty;
-                                           Reason =:= auth_old_revision;
-                                           Reason =:= invalid_auth_token ->
-            case refresh_token(Stream, Stale) of
-                {ok, NewToken} ->
-                    %% Use the same stream (not http2 stream) to retry sending the request with
-                    %% the new token
-                    ?LOG_DEBUG("Refreshing token and retrying request with new token"),
-                    Metadata = maps:get(metadata, Opts, #{}),
-                    Next(Stream, Req, Opts#{metadata => Metadata#{<<"token">> => NewToken}});
+%% @doc The unary interceptor: a request which is refused for its token is made again once with a
+%% new one (the credentials read it for the new attempts), and the errors of the server are
+%% `{etcd_error, _}' when etcdgun knows them.
+%%
+%% The deadline of the call is shared by both runs of it, and the refresh is made once for the
+%% requests which are refused at the same time, see `etcdgun_client:refresh_token/2'.
+unary(Call, Req, Next) ->
+    Stale = current_token(Call),
+    case map_error(Next(Call, Req)) of
+        {error, {etcd_error, Reason}} = Res when Reason =:= user_empty;
+                                                 Reason =:= auth_old_revision;
+                                                 Reason =:= invalid_auth_token ->
+            case refresh_token(Call, Stale) of
+                {ok, _} ->
+                    ?LOG_DEBUG("Refreshed the token, retrying ~s", [egrpc_call:method(Call)]),
+                    map_error(Next(Call, Req));
                 {error, Reason1} ->
                     ?LOG_ERROR("Failed to refresh token with reason: ~p", [Reason1]),
                     Res
             end;
-        Other -> Other
+        Res ->
+            Res
     end.
 
-stale_token(Stream) ->
-    case egrpc_stub:info(egrpc_stream:channel(Stream)) of
-        #{client := Client} when is_atom(Client) ->
+map_error({error, {grpc_error, _, _} = GrpcError}) -> {error, etcdgun_error:from_grpc_error(GrpcError)};
+map_error(Res) -> Res.
+
+%% The token the request is sent with, before it is: when it is refused and the current one is
+%% not it anymore, the token was refreshed by someone else, and there is nothing to refresh.
+current_token(Call) ->
+    case egrpc_call:info(Call) of
+        #{client := Client} ->
             case etcdgun_client:cached_token(Client) of
                 {ok, Token} -> Token;
                 undefined -> undefined
@@ -105,10 +91,9 @@ stale_token(Stream) ->
         _ -> undefined
     end.
 
-refresh_token(Stream, Stale) ->
-    Channel = egrpc_stream:channel(Stream),
-    case egrpc_stub:info(Channel) of
-        #{client := Client} when is_atom(Client) -> etcdgun_client:refresh_token(Client, Stale);
+refresh_token(Call, Stale) ->
+    case egrpc_call:info(Call) of
+        #{client := Client} -> etcdgun_client:refresh_token(Client, Stale);
         _ -> {error, not_a_client}
     end.
 
@@ -119,24 +104,24 @@ refresh_token(Stream, Stale) ->
 %% keys of the lease, and etcd 3.7 requires the token for all of them.
 should_auth_test() ->
     Yes = [
-        {'etcdserverpb.KV', 'Range'},
-        {'etcdserverpb.KV', 'Put'},
-        {'etcdserverpb.Watch', 'Watch'},
-        {'etcdserverpb.Lease', 'LeaseGrant'},
-        {'etcdserverpb.Lease', 'LeaseRevoke'},
-        {'etcdserverpb.Lease', 'LeaseKeepAlive'},
-        {'etcdserverpb.Lease', 'LeaseTimeToLive'},
-        {'etcdserverpb.Lease', 'LeaseLeases'},
-        {'etcdserverpb.Cluster', 'MemberList'},
-        {'etcdserverpb.Maintenance', 'Status'},
-        {'etcdserverpb.Auth', 'UserAdd'},
-        {'v3electionpb.Election', 'Campaign'},
-        {'v3lockpb.Lock', 'Lock'}
+        {'etcdserverpb.KV', <<"/etcdserverpb.KV/Range">>},
+        {'etcdserverpb.KV', <<"/etcdserverpb.KV/Put">>},
+        {'etcdserverpb.Watch', <<"/etcdserverpb.Watch/Watch">>},
+        {'etcdserverpb.Lease', <<"/etcdserverpb.Lease/LeaseGrant">>},
+        {'etcdserverpb.Lease', <<"/etcdserverpb.Lease/LeaseRevoke">>},
+        {'etcdserverpb.Lease', <<"/etcdserverpb.Lease/LeaseKeepAlive">>},
+        {'etcdserverpb.Lease', <<"/etcdserverpb.Lease/LeaseTimeToLive">>},
+        {'etcdserverpb.Lease', <<"/etcdserverpb.Lease/LeaseLeases">>},
+        {'etcdserverpb.Cluster', <<"/etcdserverpb.Cluster/MemberList">>},
+        {'etcdserverpb.Maintenance', <<"/etcdserverpb.Maintenance/Status">>},
+        {'etcdserverpb.Auth', <<"/etcdserverpb.Auth/UserAdd">>},
+        {'v3electionpb.Election', <<"/v3electionpb.Election/Campaign">>},
+        {'v3lockpb.Lock', <<"/v3lockpb.Lock/Lock">>}
     ],
     No = [
-        {'etcdserverpb.Auth', 'Authenticate'},
-        {'grpc.health.v1.Health', 'Check'},
-        {'grpc.reflection.v1.ServerReflection', 'ServerReflectionInfo'}
+        {'etcdserverpb.Auth', <<"/etcdserverpb.Auth/Authenticate">>},
+        {'grpc.health.v1.Health', <<"/grpc.health.v1.Health/Check">>},
+        {'grpc.reflection.v1.ServerReflection', <<"/grpc.reflection.v1.ServerReflection/ServerReflectionInfo">>}
     ],
     [?assert(should_auth(S, M)) || {S, M} <- Yes],
     [?assertNot(should_auth(S, M)) || {S, M} <- No].

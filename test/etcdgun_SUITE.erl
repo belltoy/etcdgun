@@ -130,7 +130,7 @@ open_client(Interval, Config) ->
     Opts = #{
         cred => ?CRED,
         membership_check_interval => Interval,
-        interceptors => [fun etcdgun_interceptor_auth:refresh_token/4]
+        interceptors => []
     },
     {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts),
     Config.
@@ -154,9 +154,9 @@ no_credentials(_Config) ->
     case etcd_version() of
         {3, 5} ->
             {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts),
-            {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+            Channel = ?CLIENT,
             ?assertMatch({error, _},
-                         etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})),
+                         etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()})),
             ok = etcdgun:close(?CLIENT);
         _ ->
             ?assertMatch({error, _}, open_without_cred(Opts))
@@ -221,24 +221,24 @@ binary_cred(_Config) ->
     Opts = #{membership_check_interval => infinity, cred => {<<"root">>, <<"123456">>}},
     {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, Opts),
     try
-        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+        Channel = ?CLIENT,
+        {ok, _} = etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()}),
         ok = etcdgun_client:update_cred(?CLIENT, "root", <<"123456">>),
-        {ok, Channel1} = etcdgun_client:pick_channel(?CLIENT),
-        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel1, #{key => key()})
+        Channel1 = ?CLIENT,
+        {ok, _} = etcdgun_etcdserverpb_kv_stub:range(Channel1, #{key => key()})
     after
         ok = etcdgun:close(?CLIENT)
     end.
 
 kv_and_cluster(_Config) ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     Key = key(),
-    {ok, _} = etcdgun_etcdserverpb_kv_client:put(Channel, #{key => Key, value => <<"v1">>}),
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:put(Channel, #{key => Key, value => <<"v1">>}),
     {ok, #{kvs := [#{value := <<"v1">>}]}} =
-        etcdgun_etcdserverpb_kv_client:range(Channel, #{key => Key}),
-    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+        etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => Key}),
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_stub:member_list(Channel, #{}),
     ?assertEqual(3, length(Members)),
-    {ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}),
+    {ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_stub:check(Channel, #{}),
     {ok, Info} = etcdgun_client:client_info(?CLIENT),
     ?assertMatch(#{actives := 3, authenticated := true, username := <<"root">>}, Info),
     ?assertMatch({ok, <<_/binary>>}, etcdgun_client:cached_token(?CLIENT)).
@@ -251,28 +251,28 @@ update_and_unset_cred(_Config) ->
     ok = etcdgun_client:update_cred(?CLIENT, <<"root">>, <<"123456">>),
     {ok, Token1} = etcdgun_client:cached_token(?CLIENT),
     ?assert(is_binary(Token1)),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+    Channel = ?CLIENT,
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()}),
     %% Without the credentials the token is dropped, so the server rejects the request.
     ok = etcdgun_client:unset_cred(?CLIENT),
     ?assertMatch({ok, #{authenticated := false, username := undefined}},
                  etcdgun_client:client_info(?CLIENT)),
     ?assertEqual(undefined, etcdgun_client:cached_token(?CLIENT)),
-    {ok, Channel1} = etcdgun_client:pick_channel(?CLIENT),
-    ?assertMatch({error, _}, etcdgun_etcdserverpb_kv_client:range(Channel1, #{key => key()})).
+    Channel1 = ?CLIENT,
+    ?assertMatch({error, _}, etcdgun_etcdserverpb_kv_stub:range(Channel1, #{key => key()})).
 
 %% An invalid token is refreshed by the interceptor and the request is retried. A channel which
 %% was picked before the refresh sends the new token afterwards.
 token_refresh(_Config) ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     {ok, Token0} = etcdgun_client:cached_token(?CLIENT),
     invalidate_token(Token0),
-    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()}),
     {ok, Token1} = etcdgun_client:cached_token(?CLIENT),
     ?assertNotEqual(<<"invalid.token">>, Token1),
     ?assertNotEqual(Token0, Token1),
     %% The same channel keeps working with the new token.
-    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}).
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()}).
 
 %% Many requests which are refused at once authenticate once, the others wait for the result of
 %% the refresh. Counted by tracing the calls of `Authenticate'.
@@ -282,8 +282,8 @@ token_refresh_single_flight(_Config) ->
     Self = self(),
     Count = count_authenticates(fun() ->
         Pids = [spawn_link(fun() ->
-                    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-                    Self ! {self(), etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()})}
+                    Channel = ?CLIENT,
+                    Self ! {self(), etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()})}
                 end) || _ <- lists:seq(1, 50)],
         [?assertMatch({ok, _}, receive {Pid, R} -> R after 30000 -> timeout end) || Pid <- Pids]
     end),
@@ -527,8 +527,8 @@ watch_compacted(_Config) ->
     Key = <<Prefix/binary, "/a">>,
     Rev1 = put_retry(Key, <<"1">>),
     Rev2 = put_retry(Key, <<"2">>),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    {ok, _} = etcdgun_etcdserverpb_kv_client:compact(Channel, #{revision => Rev2}),
+    Channel = ?CLIENT,
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:compact(Channel, #{revision => Rev2}),
     Req = (watch_req(Prefix))#{start_revision => Rev1},
     {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), Req),
     receive
@@ -644,19 +644,19 @@ watcher_exit_reasons(_Config) ->
     Told(shutdown).
 
 lease_keepalive(_Config) ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     {ok, #{'ID' := LeaseId}} =
-        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 3}),
+        etcdgun_etcdserverpb_lease_stub:lease_grant(Channel, #{'TTL' => 3}),
     {ok, _} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, true),
     %% Longer than the TTL, the lease is alive only because of the keepalive.
     timer:sleep(6000),
     {ok, #{'TTL' := TTL}} =
-        etcdgun_etcdserverpb_lease_client:lease_time_to_live(Channel, #{'ID' => LeaseId}),
+        etcdgun_etcdserverpb_lease_stub:lease_time_to_live(Channel, #{'ID' => LeaseId}),
     ?assert(TTL > 0),
     %% Revoked when the keepalive is stopped, `-1' is a lease which does not exist.
     ok = etcdgun_lease_keepalive_sup:stop_child(?CLIENT, LeaseId),
     {ok, #{'TTL' := -1}} =
-        etcdgun_etcdserverpb_lease_client:lease_time_to_live(Channel, #{'ID' => LeaseId}).
+        etcdgun_etcdserverpb_lease_stub:lease_time_to_live(Channel, #{'ID' => LeaseId}).
 
 %% Members which are not in the membership anymore are dropped, and come back when they are
 %% added again.
@@ -674,8 +674,8 @@ membership_sync(_Config) ->
         {ok, #{actives := N, members := Ms}} = etcdgun_client:client_info(?CLIENT),
         N =:= 3 andalso length(Ms) =:= 3
     end),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}).
+    Channel = ?CLIENT,
+    {ok, _} = etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()}).
 
 %% A member goes down and comes back, the client drops its channel and connects again.
 member_down(_Config) ->
@@ -686,8 +686,8 @@ member_down(_Config) ->
         %% The requests are served by the other members, when the member which was stopped was the
         %% leader the first ones may be refused while another one is elected.
         ok = wait_until(fun() ->
-            {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-            case etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}) of
+            Channel = ?CLIENT,
+            case etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()}) of
                 {ok, _} -> true;
                 {error, _} -> false
             end
@@ -703,8 +703,8 @@ member_down(_Config) ->
 member_add_remove(_Config) ->
     with_new_member(false, fun(Ctl) ->
         ok = wait_until(fun() -> members() =:= 4 andalso actives() =:= 4 end, 90),
-        {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-        {ok, _} = etcdgun_etcdserverpb_kv_client:range(Channel, #{key => key()}),
+        Channel = ?CLIENT,
+        {ok, _} = etcdgun_etcdserverpb_kv_stub:range(Channel, #{key => key()}),
         remove_member(Ctl, "etcd-4"),
         ok = wait_until(fun() -> members() =:= 3 andalso actives() =:= 3 end, 90)
     end).
@@ -823,12 +823,12 @@ keepalive_unknown_lease(_Config) ->
 %% The keepalive process stops with `{shutdown, lease_expired}' when its lease is gone (revoked
 %% by someone else, or expired), so a process which has to know monitors it.
 keepalive_lease_gone(_Config) ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     {ok, #{'ID' := LeaseId}} =
-        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 2}),
+        etcdgun_etcdserverpb_lease_stub:lease_grant(Channel, #{'TTL' => 2}),
     {ok, Pid} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, false),
     MRef = erlang:monitor(process, Pid),
-    {ok, _} = etcdgun_etcdserverpb_lease_client:lease_revoke(Channel, #{'ID' => LeaseId}),
+    {ok, _} = etcdgun_etcdserverpb_lease_stub:lease_revoke(Channel, #{'ID' => LeaseId}),
     receive
         {'DOWN', MRef, process, Pid, Reason} ->
             ?assertEqual({shutdown, lease_expired}, Reason)
@@ -840,9 +840,9 @@ keepalive_lease_gone(_Config) ->
 %% their connections and the lease keepalives keep running (they are not restarted, so they would
 %% be gone for good).
 one_subtree_crash(_Config) ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     {ok, #{'ID' := LeaseId}} =
-        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 30}),
+        etcdgun_etcdserverpb_lease_stub:lease_grant(Channel, #{'TTL' => 30}),
     {ok, Lease} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, true),
     {ok, #{pid := Client}} = etcdgun_client:client_info(?CLIENT),
     Sup = whereis(etcdgun_watcher_sup),
@@ -893,9 +893,9 @@ watch_without_connection(_Config) ->
 leader_change(_Config) ->
     Prefix = key(),
     {ok, _} = etcdgun:watch(?CLIENT, ct_watcher, etcdgun_ct_handler, self(), watch_req(Prefix)),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
+    Channel = ?CLIENT,
     {ok, #{'ID' := LeaseId}} =
-        etcdgun_etcdserverpb_lease_client:lease_grant(Channel, #{'TTL' => 3}),
+        etcdgun_etcdserverpb_lease_stub:lease_grant(Channel, #{'TTL' => 3}),
     {ok, _} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, LeaseId, false),
     try
         A = <<Prefix/binary, "/a">>,
@@ -908,9 +908,9 @@ leader_change(_Config) ->
         ?assertMatch([#{kv := #{key := B}}], recv_events(15000)),
         %% Longer than the TTL, the keepalive is working on the new leader.
         timer:sleep(5000),
-        {ok, Ch} = etcdgun_client:pick_channel(?CLIENT),
+        Ch = ?CLIENT,
         {ok, #{'TTL' := TTL}} =
-            etcdgun_etcdserverpb_lease_client:lease_time_to_live(Ch, #{'ID' => LeaseId}),
+            etcdgun_etcdserverpb_lease_stub:lease_time_to_live(Ch, #{'ID' => LeaseId}),
         ?assert(TTL > 0)
     after
         _ = etcdgun_lease_keepalive_sup:stop_child(?CLIENT, LeaseId),
@@ -964,8 +964,8 @@ member_id(Ctl, Name) ->
 %% `etcdctl' in the container of the leader, the client URL of the member is published on the host,
 %% so the container is the one which publishes the port.
 leader_ctl() ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+    Channel = ?CLIENT,
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_stub:member_list(Channel, #{}),
     LeaderId = leader(),
     [#{clientURLs := [Url | _]}] = [M || #{'ID' := Id} = M <- Members, Id =:= LeaderId],
     #{port := Port} = uri_string:parse(Url),
@@ -974,16 +974,16 @@ leader_ctl() ->
 
 %% The member id of the leader, by the status of any member.
 leader() ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    {ok, #{leader := Leader}} = etcdgun_etcdserverpb_maintenance_client:status(Channel, #{}),
+    Channel = ?CLIENT,
+    {ok, #{leader := Leader}} = etcdgun_etcdserverpb_maintenance_stub:status(Channel, #{}),
     Leader.
 
 %% Ask the leader to move the leadership to another member, return the old leader. The request is
 %% only accepted by the leader, so the channels are picked until one of them is its.
 move_leader() ->
     Leader = leader(),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}),
+    Channel = ?CLIENT,
+    {ok, #{members := Members}} = etcdgun_etcdserverpb_cluster_stub:member_list(Channel, #{}),
     [Target | _] = [Id || #{'ID' := Id} <- Members, Id =/= Leader],
     ok = move_leader(Leader, Target, 20),
     Leader.
@@ -991,8 +991,8 @@ move_leader() ->
 move_leader(_Leader, _Target, 0) ->
     ct:fail(move_leader_failed);
 move_leader(Leader, Target, N) ->
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    case etcdgun_etcdserverpb_maintenance_client:move_leader(Channel, #{targetID => Target}) of
+    Channel = ?CLIENT,
+    case etcdgun_etcdserverpb_maintenance_stub:move_leader(Channel, #{targetID => Target}) of
         {ok, _} -> ok;
         {error, _} -> move_leader(Leader, Target, N - 1)
     end.
@@ -1034,8 +1034,8 @@ remove_member(Ctl, Name) ->
 %% The {Major, Minor} of the server, asked through a client with the credentials.
 etcd_version() ->
     {ok, _} = etcdgun:open(?CLIENT, ?ENDPOINTS, #{cred => ?CRED, membership_check_interval => infinity}),
-    {ok, Channel} = etcdgun_client:pick_channel(?CLIENT),
-    {ok, #{version := Version}} = etcdgun_etcdserverpb_maintenance_client:status(Channel, #{}),
+    Channel = ?CLIENT,
+    {ok, #{version := Version}} = etcdgun_etcdserverpb_maintenance_stub:status(Channel, #{}),
     ok = etcdgun:close(?CLIENT),
     [Major, Minor | _] = string:split(binary_to_list(Version), ".", all),
     {list_to_integer(Major), list_to_integer(Minor)}.
@@ -1058,7 +1058,7 @@ invalidate_token(Token) ->
 count_authenticates(Fun) ->
     Self = self(),
     Tracer = spawn_link(fun() -> count_loop(0) end),
-    MFA = {etcdgun_etcdserverpb_auth_client, authenticate, 2},
+    MFA = {etcdgun_etcdserverpb_auth_stub, authenticate, 2},
     _ = erlang:trace_pattern(MFA, true, [global]),
     _ = erlang:trace(all, true, [call, {tracer, Tracer}]),
     try Fun() after
@@ -1105,7 +1105,7 @@ recv_keys(N, Timeout) ->
     Keys = [K || #{kv := #{key := K}} <- Events],
     Keys ++ recv_keys(N - length(Keys), Timeout).
 
-%% A put through a channel which may be being replaced, e.g. right after a connection was killed.
+%% A put right after a connection was killed or a member stopped, it is not repeated by etcdgun.
 %% Returns the revision of the put.
 put_retry(Key, Value) ->
     put_retry(Key, Value, 20).
@@ -1113,14 +1113,7 @@ put_retry(Key, Value) ->
 put_retry(_Key, _Value, 0) ->
     ct:fail(put_failed);
 put_retry(Key, Value, N) ->
-    Res =
-        case etcdgun_client:pick_channel(?CLIENT) of
-            {ok, Channel} ->
-                etcdgun_etcdserverpb_kv_client:put(Channel, #{key => Key, value => Value});
-            {error, _} = Error ->
-                Error
-        end,
-    case Res of
+    case etcdgun_etcdserverpb_kv_stub:put(?CLIENT, #{key => Key, value => Value}) of
         {ok, #{header := #{revision := Revision}}} -> Revision;
         {error, _} -> timer:sleep(500), put_retry(Key, Value, N - 1)
     end.

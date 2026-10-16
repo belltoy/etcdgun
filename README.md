@@ -22,8 +22,12 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
   ([`etcdgun_watcher`](src/etcdgun_watcher.erl)).
 - [x] check the member list of the cluster periodically, and sync the connections with it
   ([`etcdgun_client`](src/etcdgun_client.erl), the `membership_check_interval` option).
-- [x] etcd endpoints health check when dial.
-- [ ] health check for active channels in interval.
+- [x] one logical [`egrpc`](https://github.com/belltoy/egrpc) channel for the cluster: its endpoints
+  are the members, the connections, the reconnects and the choice of the endpoint for each call
+  (round robin) are those of egrpc.
+- [x] the read-only requests are repeated on another endpoint when the server is unavailable or
+  the connection fails, see [Retry](#retry).
+- [ ] health check for the endpoints in interval, and leader aware calls.
 - [ ] idle connection keep alive?
 
 Generating etcd v3 API codes via the proto files in etcd v3.5.10, without changing their packets.
@@ -40,15 +44,13 @@ Client = my_client,
 Opts = #{},
 {ok, _Pid} = etcdgun:open(Client, [{"127.0.0.1", 2379}], Opts),
 
-%% Now you can use `Client' to pick channels and call the etcd gRPC APIs.
-{ok, Channel} = etcdgun_client:pick_channel(Client).
-
+%% The name of the client is the name of its egrpc channel, call the etcd gRPC APIs with it.
 %% Get etcd member list via v3 API
 {ok, #{header := _, members := Members}} =
-    etcdgun_etcdserverpb_cluster_client:member_list(Channel, #{}).
+    etcdgun_etcdserverpb_cluster_stub:member_list(Client, #{}).
 
 %% Check heath via egrpc provided standard health check API
-{ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_client:check(Channel, #{}).
+{ok, #{status := 'SERVING'}} = egrpc_grpc_health_v1_health_stub:check(Client, #{}).
 ```
 
 ### Client Options
@@ -56,17 +58,37 @@ Opts = #{},
 See [`etcdgun:opts()`](https://hexdocs.pm/etcdgun/etcdgun.html#t:opts/0) for the available options.
 
 Support egrpc interceptors, set with the `interceptors` option, e.g. the request logging
-`fun etcdgun_interceptor_log:log/4` and the token refreshing
-`fun etcdgun_interceptor_auth:refresh_token/4`.
+`etcdgun_interceptor_log` (a module with `unary/3`, see `m:egrpc_interceptor`).
 
-The authentication token is not an interceptor: etcdgun sets egrpc `call_credentials` on every
-channel it opens, which adds the current token of the client to each call, streaming calls
-included. When the token is refreshed, the channels already picked use the new one too.
+The authentication is set by etcdgun on every client: egrpc `call_credentials` add the current
+token to each attempt of a call, streaming calls included, and the first interceptor refreshes
+the token when it is refused (once for the requests which are refused at the same time) and maps
+the errors of the server to `{etcd_error, Reason}`.
+
+### Retry
+
+The calls are made by egrpc, in your process. Every attempt of a call picks an endpoint again, and
+the `deadline` of the call (milliseconds, in the options of the call) is shared by the attempts.
+Without anything else only a request which was not sent (`GOAWAY`, a refused stream) is made
+again. The protos of etcd do not mark the read-only methods, so they are repeated (when the
+server is `unavailable` or the connection fails, up to 6 attempts, about 2.5 seconds of waiting on
+average) with the options of `etcdgun_retry:opts/2,3`:
+
+```erlang
+Opts = etcdgun_retry:opts(etcdgun_etcdserverpb_kv_stub, range, #{deadline => 10000}),
+{ok, _} = etcdgun_etcdserverpb_kv_stub:range(my_client, #{key => <<"foo">>}, Opts).
+```
+
+`Range`, `LeaseTimeToLive`, `LeaseLeases`, `MemberList`, `Alarm`, `Status`, `Hash`, `HashKV` and
+the read-only requests of `Auth` are in the table. The writes (`Put`, `DeleteRange`, `Txn`, ...),
+`LeaseGrant` and `LeaseRevoke` are not: the result of one which failed after it was sent is not
+known, the caller decides. The streams (watch, lease keepalive) are not repeated by egrpc, see
+[Watch](#watch) and [Lease Keepalive](#lease-keepalive).
 
 ### Lease Keepalive
 
 `etcdgun_lease_keepalive_sup:start_child(Client, LeaseId, RevokeWhenShutdown)` starts a process
-which keeps the lease alive, on its own connection to the cluster and reconnecting when it is
+which keeps the lease alive, on its own stream to the cluster and reconnecting when it is
 lost. `RevokeWhenShutdown` revokes the lease when the process is stopped normally.
 
 `start_child/3` returns `{error, Reason}` when the process can not start, e.g. `lease_expired`
@@ -200,19 +222,19 @@ The certificate of the server is verified by the TLS options of gun and OTP. Pas
 
 ### API Call
 
-The channel from `etcdgun_client:pick_channel/1` is used with the generated clients, e.g.
-`etcdgun_etcdserverpb_kv_client`. The token is added to every call for you.
+The name of the client is used with the generated stubs, e.g. `etcdgun_etcdserverpb_kv_stub`.
+The token is added to every call for you.
 
 #### Known issue: `MemberPromote` with authentication on etcd 3.5 and 3.6
 
 When the authentication is enabled, etcd 3.5 and 3.6 reject
-`etcdgun_etcdserverpb_cluster_client:member_promote/2` if the channel is connected to a
+`etcdgun_etcdserverpb_cluster_stub:member_promote/2` if the channel is connected to a
 follower: the follower forwards the request to the leader with an internal request which has no
 token, the leader logs `failed to promote a member ... auth: user name is empty` and the caller
 only gets `{error, ...}` of `request timed out`. It is not a problem of the token of etcdgun,
-and the request works when it reaches the leader. etcd 3.7 does not have it. Send the
-`member_promote` through the channel of the leader, e.g. the member whose id is the `leader`
-of `etcdgun_etcdserverpb_maintenance_client:status/2`. The other member requests (`member_add`,
+and the request works when it reaches the leader. etcd 3.7 does not have it. A client has one channel
+for the cluster and a call can not choose the member, so open a client with the endpoint of the
+leader only (the `leader` of `etcdgun_etcdserverpb_maintenance_stub:status/2`) for it. The other member requests (`member_add`,
 `member_remove`, `member_list`) are not affected.
 
 

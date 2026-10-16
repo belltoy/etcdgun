@@ -1,25 +1,19 @@
-%% @doc This module provides a gRPC interceptor that logs details about each gRPC request of etcd,
-%% including the service and method names, request parameters (with sensitive data redacted),
-%% and the duration of the request processing.
+%% @doc A unary interceptor which logs each gRPC request of etcd: the service and method, the
+%% request (the password redacted) and how long it took.
 %%
-%% See `log/4' function for implementation details.
-%%
-%% See also `t:egrpc_stub:unary_interceptor/0' for the type of gRPC unary interceptor.
+%% Add `etcdgun_interceptor_log' to the `interceptors' option of the client, see `m:egrpc_interceptor'.
 -module(etcdgun_interceptor_log).
 
 -include_lib("kernel/include/logger.hrl").
 
--export([log/4]).
+-export([unary/3]).
 
-log(Stream, Request, Opts, Next) ->
-    ?LOG_DEBUG("Logging gRPC request for RPC ~s.~s",
-               [egrpc_stream:grpc_service(Stream), egrpc_stream:grpc_method(Stream)]),
-    GrpcType = egrpc_stream:grpc_type(Stream),
-    {Duration, Res} = timer:tc(Next, [Stream, Request, Opts]),
+unary(Call, Request, Next) ->
+    ?LOG_DEBUG("Logging gRPC request for RPC ~s", [egrpc_call:method(Call)]),
+    {Duration, Res} = timer:tc(Next, [Call, Request]),
     LogData = #{
-        grpc_type => GrpcType,
-        grpc_service => egrpc_stream:grpc_service(Stream),
-        grpc_method => egrpc_stream:grpc_method(Stream),
+        grpc_service => egrpc_call:service(Call),
+        grpc_method => egrpc_call:method(Call),
         request => maps:map(fun
                                 (password, _Value) -> "<redacted>";
                                 (_Key, Value) -> Value
@@ -27,9 +21,9 @@ log(Stream, Request, Opts, Next) ->
         duration => Duration div 1000 % Convert microseconds to milliseconds
     },
     case Res of
-        {ok, _} ->
-            ?LOG_INFO(LogData#{msg => "gRPC request successful"});
         {error, Reason} ->
-            ?LOG_ERROR(LogData#{msg => "gRPC request failed", reason => Reason})
+            ?LOG_ERROR(LogData#{msg => "gRPC request failed", reason => Reason});
+        _ ->
+            ?LOG_INFO(LogData#{msg => "gRPC request successful"})
     end,
     Res.

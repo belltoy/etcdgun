@@ -19,7 +19,6 @@
 -record(state, {
     client :: etcdgun:client(),
     conn_pid :: pid(),
-    channel :: egrpc:channel(),
     stream :: egrpc:stream(),
     stream_ref :: reference(),
     lease_id :: integer(),
@@ -97,7 +96,7 @@ handle_info(Info, State) ->
     {noreply, State}.
 
 handle_continue({retry, Reason}, #state{retry_ref = undefined} = State) ->
-    gun:cancel(State#state.conn_pid, State#state.stream_ref),
+    egrpc_stream:cancel_stream(State#state.stream),
     ?LOG_WARNING("Lease keepalive error: ~p, retry", [Reason]),
     TRef = erlang:start_timer(1000, self(), retry),
     {noreply, cancel_scheduler(State#state{retry_ref = TRef})};
@@ -134,9 +133,9 @@ terminate(Reason, #state{stream = Stream} = State) ->
             ?LOG_ERROR("Terminating lease keepalive with reason: ~p", [Reason]),
             ok
     end,
-    %% The stream is cancelled anyway, so whether the close of the send side succeeded is not
-    %% important.
-    _ = egrpc_stream:close_send(Stream),
+    %% Not closed first: the trailers which the server sends for that come after the cancel, and
+    %% gun takes the HEADERS of a closed stream for an error of the connection, which fails the
+    %% other requests on it.
     egrpc_stream:cancel_stream(Stream),
     ok.
 
@@ -149,9 +148,9 @@ is_normal({shutdown, lease_expired}) -> false;
 is_normal({shutdown, _}) -> true;
 is_normal(_) -> false.
 
-revoke(#state{channel = Channel, lease_id = LeaseId} = State) ->
-    Req = #{'ID' => State#state.lease_id},
-    Res = case etcdgun_etcdserverpb_lease_client:lease_revoke(Channel, Req) of
+revoke(#state{client = Client, lease_id = LeaseId}) ->
+    Req = #{'ID' => LeaseId},
+    Res = case etcdgun_etcdserverpb_lease_stub:lease_revoke(Client, Req) of
         {ok, _} -> ok;
         {error, {etcd_error, lease_not_found}} -> ok;
         {error, R} -> R
@@ -162,18 +161,16 @@ revoke(#state{channel = Channel, lease_id = LeaseId} = State) ->
         Reason -> ?LOG_ERROR("Failed to revoke lease ~p: ~p", [LeaseId, Reason])
     end.
 
-recv_create_response(Client, LeaseId, Stream, Channel, RevokeWhenShutdown) ->
-    ConnPid = egrpc_stub:conn_pid(Stream),
+recv_create_response(Client, LeaseId, Stream, RevokeWhenShutdown) ->
+    ConnPid = egrpc_stream:conn_pid(Stream),
     MRef = monitor(process, ConnPid),
     maybe
         {ok, Stream1} ?= egrpc_stream:recv_header(Stream, 1000),
-        Res = egrpc_stream:recv_msg(Stream1, 1000, <<>>),
-        {ok, Stream2, #{'ID' := LeaseId, 'TTL' := TTL}, Rest} ?= Res,
+        {ok, Stream2, #{'ID' := LeaseId, 'TTL' := TTL}} ?= egrpc_stream:recv_msg(Stream1, 1000),
         {ok, TRef} ?= schedule_keepalive(TTL),
         ?LOG_NOTICE("Lease keepalive started for lease ~p with TTL ~p", [LeaseId, TTL]),
         {ok, #state{
             client = Client,
-            channel = Channel,
             conn_pid = ConnPid,
             stream_ref = egrpc_stream:stream_ref(Stream2),
             stream = Stream2,
@@ -181,7 +178,7 @@ recv_create_response(Client, LeaseId, Stream, Channel, RevokeWhenShutdown) ->
             monitor_ref = MRef,
             timer_ref = TRef,
             revoke_when_shutdown = RevokeWhenShutdown,
-            buf = Rest
+            buf = <<>>
         }}
     else
         E ->
@@ -192,18 +189,9 @@ recv_create_response(Client, LeaseId, Stream, Channel, RevokeWhenShutdown) ->
 
 new_request(Client, LeaseId, RevokeWhenShutdown) ->
     maybe
-        {ok, Channel} ?= pick_channel(Client),
-        {ok, Stream} ?= etcdgun_etcdserverpb_lease_client:lease_keep_alive(Channel),
+        {ok, Stream} ?= etcdgun_etcdserverpb_lease_stub:lease_keep_alive(Client),
         {ok, Stream1} ?= egrpc_stream:send_msg(Stream, #{'ID' => LeaseId}, nofin),
-        recv_create_response(Client, LeaseId, Stream1, Channel, RevokeWhenShutdown)
-    end.
-
-pick_channel(Client) ->
-    try
-        etcdgun_client:pick_channel(Client)
-    catch
-        exit:{noproc, _} ->
-            {error, client_not_running}
+        recv_create_response(Client, LeaseId, Stream1, RevokeWhenShutdown)
     end.
 
 -spec schedule_keepalive(pos_integer()) -> {ok, reference()} | {error, lease_expired}.

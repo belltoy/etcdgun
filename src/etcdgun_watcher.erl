@@ -116,14 +116,13 @@ try_connect(State) ->
 %% Open the watch stream and send the create request.
 connect(#state{client = Client} = State) ->
     maybe
-        {ok, Channel} ?= pick_channel(Client),
-        {ok, Stream} ?= etcdgun_etcdserverpb_watch_client:watch(Channel),
+        {ok, Stream} ?= etcdgun_etcdserverpb_watch_stub:watch(Client),
         %% After a lost connection the watch resumes after the last revision which was handled.
         Request1 = resume_request(State),
         case create_watch(Stream, Request1) of
             {ok, Stream1} ->
                 %% Monitor the gun connection pid.
-                ConnPid = egrpc_stub:conn_pid(Stream1),
+                ConnPid = egrpc_stream:conn_pid(Stream1),
                 MRef = erlang:monitor(process, ConnPid),
                 TRef = erlang:start_timer(5000, self(), create_watch_timeout),
                 {ok, State#state{
@@ -148,13 +147,6 @@ create_watch(Stream, Request) ->
         {ok, Stream1} ?= egrpc_stream:send_msg(
                            Stream, #{request_union => {create_request, Request}}, nofin),
         egrpc_stream:recv_header(Stream1, 5000)
-    end.
-
-pick_channel(Client) ->
-    try
-        etcdgun_client:pick_channel(Client)
-    catch
-        exit:{noproc, _} -> {error, client_not_running}
     end.
 
 handle_call(_Request, _From, State) ->
@@ -514,11 +506,10 @@ last_revision(#{header := #{revision := Revision}}) ->
     Revision.
 
 
-cancel_stream(#state{conn_pid = ConnPid, stream_ref = StreamRef})
-  when is_pid(ConnPid), is_reference(StreamRef) ->
-    gun:cancel(ConnPid, StreamRef);
-cancel_stream(#state{}) ->
-    ok.
+cancel_stream(#state{stream = undefined}) ->
+    ok;
+cancel_stream(#state{stream = Stream}) ->
+    egrpc_stream:cancel_stream(Stream).
 
 %% The reference of the stream does not change, the stream is the state of the interceptors.
 update_stream(Stream, #state{} = State) ->
