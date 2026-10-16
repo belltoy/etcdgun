@@ -63,6 +63,8 @@
     %% The endpoints of the channel, with `healthy' in the attributes.
     published = [] :: [map()],
     probing = #{} :: #{binary() => {pid(), reference()}},
+    %% The processes of `initial_probe/1' are linked, their exit signals are the first messages.
+    init_probes = [] :: [pid()],
     probe_tref = undefined :: undefined | reference(),
     probe_tick = 0 :: non_neg_integer(),
     transport :: tcp | tls,
@@ -408,7 +410,15 @@ handle_info({'DOWN', MRef, process, Pid, Reason}, #state{probing = Probing} = St
             {noreply, State}
     end;
 
+handle_info({'EXIT', Pid, normal} = Info, #state{init_probes = Pids} = State) ->
+    case lists:member(Pid, Pids) of
+        true -> {noreply, State#state{init_probes = lists:delete(Pid, Pids)}};
+        false -> unexpected_info(Info, State)
+    end;
 handle_info(Info, State) ->
+    unexpected_info(Info, State).
+
+unexpected_info(Info, State) ->
     ?LOG_WARNING("Received unexpected info message: ~p", [Info]),
     {noreply, State}.
 
@@ -614,7 +624,8 @@ initial_probe(#state{name = Name, endpoints = Endpoints, health = Health} = Stat
                 true -> ok;
                 false -> timer:sleep(100)
             end,
-            initial_probe(publish(State#state{health = Health1}), Until)
+            initial_probe(publish(State#state{health = Health1, init_probes = Pids ++ State#state.init_probes}),
+                          Until)
     end.
 
 %% Check one endpoint, by the hint to the balancer.
@@ -772,6 +783,14 @@ format_status_test() ->
     ?assertMatch(#{state := #state{cred = undefined, token = undefined}},
                  format_status(#{state => NoCred})),
     ?assertEqual(#{reason => x}, format_status(#{reason => x})).
+
+exit_of_initial_probe_test() ->
+    P = spawn(fun() -> ok end),
+    State = #state{name = foo, init_probes = [P]},
+    ?assertMatch({noreply, #state{init_probes = []}}, handle_info({'EXIT', P, normal}, State)),
+    %% the exit of any other process is still unexpected, and the probes are kept
+    {noreply, State1} = handle_info({'EXIT', self(), normal}, State),
+    ?assertEqual([P], State1#state.init_probes).
 
 member_endpoints_test() ->
     M = fun(Id, Urls) -> #{'ID' => Id, clientURLs => Urls} end,
