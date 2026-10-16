@@ -275,6 +275,9 @@ do_init(Client, Endpoints, Opts0, Cred, Transport) ->
         State1 = publish_token(State0#state{token = Token}),
         {ok, Members} ?= get_member_list(Client, Token),
         ok ?= check_endpoint(Client, Token, etcdgun_retry:opts(etcdgun_etcdserverpb_maintenance_stub, status)),
+        %% NOTE: the subchannels of the members were just published and may not be connected yet,
+        %% so the first round of the check can fail with `target_not_ready' (logged as errors by
+        %% the log interceptor). The members are checked again until they pass or the time is up.
         State2 = initial_probe(apply_members(Members, State1)),
         ?LOG_INFO(#{msg => "Connected to etcd", members => Members}),
         {ok, start_membership_timer(start_probe_timer(?PROBE_INTERVAL, State2))}
