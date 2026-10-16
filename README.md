@@ -207,10 +207,12 @@ Things to know:
 
 ### TLS
 
-The members of the cluster are connected with the scheme of their client URLs, `https://` is TLS.
-The `Endpoints` given to `etcdgun:open/3` have no scheme, so `transport => tls` tells that they
-are TLS, and `gun_opts` are the options of [gun](https://hex.pm/packages/gun) of every
-connection, e.g. the CA of the cluster:
+The transport is a setting of the whole channel, not of an endpoint (a limit of egrpc): the client
+URLs of the members found by the member list are used only if their scheme is the one of
+`transport` (`http://` is `tcp`, `https://` is `tls`). A member of the other scheme is ignored, so a
+cluster which mixes both is not supported. The `Endpoints` given to `etcdgun:open/3` have no
+scheme, so `transport => tls` tells that they are TLS, and `gun_opts` are the options of
+[gun](https://hex.pm/packages/gun) of every connection, e.g. the CA of the cluster:
 
 ```erlang
 {ok, _} = etcdgun:open(my_client, [{"etcd.example.com", 2379}], #{
