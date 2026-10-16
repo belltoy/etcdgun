@@ -1,3 +1,8 @@
+%% @private
+%% @doc The keepalive of one lease: the process which keeps it, and tells how it ends.
+%%
+%% The stream is the one of the client (`etcdgun_lease_manager'), this process asks for a keepalive
+%% at a third of the time to live, and ends with `{shutdown, lease_expired}' when the lease is gone.
 -module(etcdgun_lease_keepalive).
 
 -feature(maybe_expr, enable).
@@ -12,22 +17,21 @@
     handle_call/3,
     handle_cast/2,
     handle_info/2,
-    handle_continue/2,
     terminate/2
 ]).
 
 -record(state, {
     client :: etcdgun:client(),
-    conn_pid :: pid(),
-    stream :: egrpc:stream(),
-    stream_ref :: reference(),
     lease_id :: integer(),
-    monitor_ref :: reference(),
+    ttl :: undefined | pos_integer(),
+    manager :: undefined | reference(),
     timer_ref :: undefined | reference(),
+    %% The manager was lost, the lease is registered again.
     retry_ref :: undefined | reference(),
-    revoke_when_shutdown = false :: boolean(),
-    buf = <<>> :: binary()
+    revoke_when_shutdown = false :: boolean()
 }).
+
+-define(RETRY_INTERVAL, 1000).
 
 -spec start_link(etcdgun:client(), LeaseId :: integer(), boolean()) -> gen_server:start_ret().
 start_link(Client, LeaseId, RevokeWhenShutdown) ->
@@ -39,8 +43,11 @@ start_link(Client, LeaseId, RevokeWhenShutdown) ->
 
 init({Client, LeaseId, RevokeWhenShutdown}) ->
     process_flag(trap_exit, true),
-    case new_request(Client, LeaseId, RevokeWhenShutdown) of
-        {ok, State} -> {ok, State};
+    State = #state{client = Client, lease_id = LeaseId, revoke_when_shutdown = RevokeWhenShutdown},
+    case register(State) of
+        {ok, State1} ->
+            ?LOG_NOTICE("Lease keepalive started for lease ~p with TTL ~p", [LeaseId, State1#state.ttl]),
+            {ok, State1};
         {error, Reason} ->
             ?LOG_ERROR("Failed to start keepalive for lease ~p: ~p", [LeaseId, Reason]),
             %% `{error, _}' is not a return of init/1, it would hide the reason.
@@ -53,72 +60,35 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({timeout, TRef, retry}, #state{client = Client, retry_ref = TRef} = State) ->
-    case new_request(Client, State#state.lease_id, State#state.revoke_when_shutdown) of
-        {ok, NewState} -> {noreply, NewState};
-        {error, lease_expired} ->
-            {stop, {shutdown, lease_expired}, State};
-        {error, Reason} ->
-            {noreply, State#state{retry_ref = undefined}, {continue, {retry, Reason}}}
-    end;
-handle_info({timeout, TRef, keepalive}, #state{lease_id = LeaseId, timer_ref = TRef} = State) ->
-    Request = #{'ID' => LeaseId},
-    case egrpc_stream:send_msg(State#state.stream, Request, nofin) of
-        {ok, Stream1} ->
-            {noreply, State#state{timer_ref = undefined, stream = Stream1}};
-        {error, Reason} ->
-            {noreply, State#state{timer_ref = undefined}, {continue, {retry, Reason}}}
-    end;
+%% The time to live which the server says now.
+handle_info({lease_keepalive, LeaseId, TTL}, #state{lease_id = LeaseId} = State) ->
+    {noreply, State#state{ttl = TTL}};
+handle_info({lease_expired, LeaseId}, #state{lease_id = LeaseId} = State) ->
+    {stop, {shutdown, lease_expired}, State};
 
-%% Receive messages from the Gun connection
-handle_info({gun_data, _ConnPid, StreamRef, nofin, Data},
-            #state{stream_ref = StreamRef, buf = Buf} = State) ->
-    {noreply, State#state{buf = <<Buf/binary, Data/binary>>}, {continue, process_data}};
-handle_info({gun_data, _ConnPid, StreamRef, fin, _Data}, #state{stream_ref = StreamRef} = State) ->
-    {noreply, State, {continue, {retry, {grpc_error, eos}}}};
-handle_info({gun_trailers, _ConnPid, StreamRef, _Trailers},
-            #state{stream_ref = StreamRef} = State) ->
-    %% When there is no leader
-    {noreply, State, {continue, {retry, {grpc_error, eos}}}};
-handle_info({gun_error, _ConnPid, StreamRef, Reason},
-            #state{stream_ref = StreamRef} = State) ->
-    {noreply, State, {continue, {retry, {stream_error, Reason}}}};
-handle_info({gun_error, ConnPid, Reason}, #state{conn_pid = ConnPid} = State) ->
-    {noreply, State, {continue, {retry, {connection_error, Reason}}}};
-handle_info({gun_down, _GunPid, http2, Reason, _Streams}, State) ->
-    {noreply, State, {continue, {retry, {connection_down, Reason}}}};
-handle_info({'DOWN', MRef, process, ConnPid, Reason},
-            #state{conn_pid = ConnPid, monitor_ref = MRef} = State) ->
-    {noreply, State, {continue, {retry, {connection_down, Reason}}}};
+handle_info({timeout, TRef, keepalive}, #state{client = Client, lease_id = LeaseId, timer_ref = TRef} = State) ->
+    etcdgun_lease_manager:keepalive(Client, LeaseId),
+    {noreply, schedule(State)};
+
+%% The manager is gone, with the stream: register again, a new one is started.
+handle_info({'DOWN', MRef, process, _Pid, Reason}, #state{manager = MRef} = State) ->
+    ?LOG_WARNING("Lease keepalive manager is gone: ~p", [Reason]),
+    {noreply, retry(State)};
+handle_info({timeout, TRef, retry}, #state{client = Client, retry_ref = TRef} = State) ->
+    _ = etcdgun_lease_manager:ensure_started(Client),
+    case register(State#state{retry_ref = undefined}) of
+        {ok, State1} -> {noreply, State1};
+        {error, lease_expired} -> {stop, {shutdown, lease_expired}, State};
+        {error, Reason} ->
+            ?LOG_WARNING("Lease keepalive can not register again: ~p", [Reason]),
+            {noreply, retry(State)}
+    end;
 
 handle_info(Info, State) ->
     ?LOG_WARNING("Unexpected message received in lease keepalive process: ~p", [Info]),
     {noreply, State}.
 
-handle_continue({retry, Reason}, #state{retry_ref = undefined} = State) ->
-    egrpc_stream:cancel_stream(State#state.stream),
-    ?LOG_WARNING("Lease keepalive error: ~p, retry", [Reason]),
-    TRef = erlang:start_timer(1000, self(), retry),
-    {noreply, cancel_scheduler(State#state{retry_ref = TRef})};
-handle_continue({retry, _Reason}, State) ->
-    {noreply, State};
-handle_continue(process_data, #state{buf = Buf, stream = Stream} = State) ->
-    case egrpc_stream:parse_msg(Stream, Buf) of
-        more -> {noreply, State};
-        {error, Reason} ->
-            {noreply, State, {continue, {retry, {grpc_error, Reason}}}};
-        {ok, Stream1, #{'ID' := _LeaseId, 'TTL' := TTL}, Rest} when TTL > 0 ->
-            case schedule_keepalive(TTL) of
-                {ok, TRef} ->
-                    {noreply, State#state{buf = Rest, stream = Stream1, timer_ref = TRef}};
-                {error, lease_expired} ->
-                    {stop, {shutdown, lease_expired}, State}
-            end;
-        {ok, _Stream1, _Resp, _Rest} ->
-            {stop, {shutdown, lease_expired}, State}
-    end.
-
-terminate(Reason, #state{stream = Stream} = State) ->
+terminate(Reason, #state{client = Client, lease_id = LeaseId} = State) ->
     case is_normal(Reason) of
         true ->
             ?LOG_INFO("Terminating lease keepalive with reason: ~p", [Reason]),
@@ -133,11 +103,7 @@ terminate(Reason, #state{stream = Stream} = State) ->
             ?LOG_ERROR("Terminating lease keepalive with reason: ~p", [Reason]),
             ok
     end,
-    %% Not closed first: the trailers which the server sends for that come after the cancel, and
-    %% gun takes the HEADERS of a closed stream for an error of the connection, which fails the
-    %% other requests on it.
-    egrpc_stream:cancel_stream(Stream),
-    ok.
+    etcdgun_lease_manager:unregister_lease(Client, LeaseId).
 
 %%-------------------------------------------------------------------
 %% Private functions
@@ -147,6 +113,23 @@ is_normal(shutdown) -> true;
 is_normal({shutdown, lease_expired}) -> false;
 is_normal({shutdown, _}) -> true;
 is_normal(_) -> false.
+
+register(#state{client = Client, lease_id = LeaseId} = State) ->
+    maybe
+        {ok, TTL} ?= etcdgun_lease_manager:register_lease(Client, LeaseId, self()),
+        MRef = erlang:monitor(process, etcdgun_lease_manager:name(Client)),
+        {ok, schedule(State#state{ttl = TTL, manager = MRef})}
+    end.
+
+retry(#state{} = State) ->
+    TRef = erlang:start_timer(?RETRY_INTERVAL, self(), retry),
+    State#state{retry_ref = TRef}.
+
+%% The next keepalive, at a third of the time to live.
+schedule(#state{ttl = TTL, timer_ref = Old} = State) when is_integer(TTL) ->
+    is_reference(Old) andalso erlang:cancel_timer(Old),
+    After = erlang:max(TTL div 3, 1) * 1000,
+    State#state{timer_ref = erlang:start_timer(After, self(), keepalive)}.
 
 revoke(#state{client = Client, lease_id = LeaseId}) ->
     Req = #{'ID' => LeaseId},
@@ -161,49 +144,14 @@ revoke(#state{client = Client, lease_id = LeaseId}) ->
         Reason -> ?LOG_ERROR("Failed to revoke lease ~p: ~p", [LeaseId, Reason])
     end.
 
-recv_create_response(Client, LeaseId, Stream, RevokeWhenShutdown) ->
-    ConnPid = egrpc_stream:conn_pid(Stream),
-    MRef = monitor(process, ConnPid),
-    maybe
-        {ok, Stream1} ?= egrpc_stream:recv_header(Stream, 1000),
-        {ok, Stream2, #{'ID' := LeaseId, 'TTL' := TTL}} ?= egrpc_stream:recv_msg(Stream1, 1000),
-        {ok, TRef} ?= schedule_keepalive(TTL),
-        ?LOG_NOTICE("Lease keepalive started for lease ~p with TTL ~p", [LeaseId, TTL]),
-        {ok, #state{
-            client = Client,
-            conn_pid = ConnPid,
-            stream_ref = egrpc_stream:stream_ref(Stream2),
-            stream = Stream2,
-            lease_id = LeaseId,
-            monitor_ref = MRef,
-            timer_ref = TRef,
-            revoke_when_shutdown = RevokeWhenShutdown,
-            buf = <<>>
-        }}
-    else
-        E ->
-            egrpc_stream:cancel_stream(Stream),
-            erlang:demonitor(MRef, [flush]),
-            E
-    end.
+-ifdef(TEST).
+-include_lib("eunit/include/eunit.hrl").
 
-new_request(Client, LeaseId, RevokeWhenShutdown) ->
-    maybe
-        {ok, Stream} ?= etcdgun_etcdserverpb_lease_stub:lease_keep_alive(Client),
-        {ok, Stream1} ?= egrpc_stream:send_msg(Stream, #{'ID' => LeaseId}, nofin),
-        recv_create_response(Client, LeaseId, Stream1, RevokeWhenShutdown)
-    end.
-
--spec schedule_keepalive(pos_integer()) -> {ok, reference()} | {error, lease_expired}.
-schedule_keepalive(TTL) when is_integer(TTL), TTL > 0 ->
-    %% eqwalizer:ignore
-    After = erlang:max(round(TTL / 3), 1) * 1000,
-    {ok, erlang:start_timer(After, self(), keepalive)};
-schedule_keepalive(_TTL) ->
-    {error, lease_expired}.
-
-cancel_scheduler(#state{timer_ref = undefined} = State) ->
-    State;
-cancel_scheduler(#state{timer_ref = TRef} = State) when is_reference(TRef) ->
-    erlang:cancel_timer(TRef),
-    State#state{timer_ref = undefined}.
+schedule_test() ->
+    State = schedule(#state{ttl = 9, timer_ref = undefined}),
+    ?assert(is_reference(State#state.timer_ref)),
+    erlang:cancel_timer(State#state.timer_ref),
+    %% a short time to live is still a second
+    State1 = schedule(#state{ttl = 1, timer_ref = undefined}),
+    ?assert(erlang:cancel_timer(State1#state.timer_ref) > 900).
+-endif.

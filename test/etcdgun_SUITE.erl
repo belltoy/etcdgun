@@ -33,6 +33,7 @@
     watch_auth_failed/1,
     watcher_exit_reasons/1,
     lease_keepalive/1,
+    lease_keepalive_shared_stream/1,
     membership_sync/1,
     member_down/1,
     member_add_remove/1,
@@ -84,6 +85,7 @@ all() ->
         watch_auth_failed,
         watcher_exit_reasons,
         lease_keepalive,
+        lease_keepalive_shared_stream,
         membership_sync,
         member_down,
         member_add_remove,
@@ -662,6 +664,42 @@ lease_keepalive(_Config) ->
     ok = etcdgun_lease_keepalive_sup:stop_child(?CLIENT, LeaseId),
     {ok, #{'TTL' := -1}} =
         etcdgun_etcdserverpb_lease_stub:lease_time_to_live(Channel, #{'ID' => LeaseId}).
+
+%% The leases of a client share one stream, which is opened again when its connection is lost.
+lease_keepalive_shared_stream(_Config) ->
+    Grant = fun() ->
+        {ok, #{'ID' := Id}} = etcdgun_etcdserverpb_lease_stub:lease_grant(?CLIENT, #{'TTL' => 3}),
+        {ok, _} = etcdgun_lease_keepalive_sup:start_child(?CLIENT, Id, true),
+        Id
+    end,
+    Ids = [Grant() || _ <- lists:seq(1, 3)],
+    Alive = fun(Id) ->
+        {ok, #{'TTL' := TTL}} = etcdgun_etcdserverpb_lease_stub:lease_time_to_live(?CLIENT, #{'ID' => Id}),
+        TTL > 0
+    end,
+    try
+        Manager = whereis(etcdgun_lease_manager:name(?CLIENT)),
+        {connected, Data} = sys:get_state(Manager),
+        %% the leases, and the connection of the one stream (the field `conn_pid' of the data)
+        ?assertEqual(3, map_size(element(3, Data))),
+        ConnPid = element(7, Data),
+        exit(ConnPid, kill),
+        ok = wait_until(fun() ->
+            case sys:get_state(Manager) of
+                {connected, Data1} -> element(7, Data1) =/= ConnPid;
+                _ -> false
+            end
+        end, 20),
+        %% longer than the time to live: alive only because of the keepalive
+        timer:sleep(5000),
+        ?assertEqual([true, true, true], [Alive(Id) || Id <- Ids])
+    after
+        [etcdgun_lease_keepalive_sup:stop_child(?CLIENT, Id) || Id <- Ids]
+    end,
+    ?assertEqual([-1, -1, -1], [begin
+        {ok, #{'TTL' := TTL}} = etcdgun_etcdserverpb_lease_stub:lease_time_to_live(?CLIENT, #{'ID' => Id}),
+        TTL
+    end || Id <- Ids]).
 
 %% Members which are not in the membership anymore are dropped, and come back when they are
 %% added again.

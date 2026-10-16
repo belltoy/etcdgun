@@ -44,11 +44,13 @@ just clean         # Cleans persistent data (data/etcd-{1,2,3})
 **Hand-written modules** (src/):
 - `etcdgun.erl` - Public API (open, close, watch, prefix_range_end)
 - `etcdgun_client.erl` - Owns the one egrpc channel of a client (named after it): credentials, token refresh, member sync (gen_server)
+- `etcdgun_balancer.erl` - egrpc balancer: round robin among ready endpoints that passed etcdgun's check (`healthy` attribute); `etcdgun_target` call attribute picks one endpoint (how the check runs)
 - `etcdgun_retry.erl` - Retry policy of the channel and the options of the read-only methods
 - `etcdgun_*_sup.erl` - Supervisor tree (client, watcher, lease keep-alive)
 - `etcdgun_interceptor_*.erl` - Auth (call credentials + unary interceptor) & logging interceptors
-- `etcdgun_watcher.erl` - Watch stream with auto-reconnect
-- `etcdgun_lease_keepalive.erl` - Lease TTL refresh with periodic pings
+- `etcdgun_watcher.erl` - Watch as a `gen_statem` (connecting, creating, watching, refreshing_auth), resumes after the last revision, drops events already given
+- `etcdgun_lease_manager.erl` - the one `LeaseKeepAlive` stream of a client and the registry of its leases (reopens the stream, resends for all leases)
+- `etcdgun_lease_keepalive.erl` - one process per lease: asks the manager for a keepalive at TTL/3, exits `{shutdown, lease_expired}` when the lease is gone
 
 **Auto-generated modules** (src/stubs/ & src/protos/, read-only):
 - `etcdgun_*_stub.erl` - gRPC service stubs (Auth, KV, Watch, Lease, Cluster, Maintenance, Election, Lock)

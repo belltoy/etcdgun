@@ -27,7 +27,10 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
   (round robin) are those of egrpc.
 - [x] the read-only requests are repeated on another endpoint when the server is unavailable or
   the connection fails, see [Retry](#retry).
-- [ ] health check for the endpoints in interval, and leader aware calls.
+- [x] an endpoint is checked (health service, and the member knows a leader) when it connects and is
+  not used until it passes, then again every 10 seconds (every second while it does not pass);
+  the requests carry `hasleader`, so a member without a leader refuses them at once.
+- [ ] leader aware calls, temporary penalty of endpoints which fail often.
 - [ ] idle connection keep alive?
 
 Generating etcd v3 API codes via the proto files in etcd v3.5.10, without changing their packets.
@@ -88,8 +91,9 @@ known, the caller decides. The streams (watch, lease keepalive) are not repeated
 ### Lease Keepalive
 
 `etcdgun_lease_keepalive_sup:start_child(Client, LeaseId, RevokeWhenShutdown)` starts a process
-which keeps the lease alive, on its own stream to the cluster and reconnecting when it is
-lost. `RevokeWhenShutdown` revokes the lease when the process is stopped normally.
+which keeps the lease alive. The leases of a client share one `LeaseKeepAlive` stream, which is
+opened again (on another endpoint) when it is lost, and a keepalive is sent for every lease at once.
+`RevokeWhenShutdown` revokes the lease when the process is stopped normally.
 
 `start_child/3` returns `{error, Reason}` when the process can not start, e.g. `lease_expired`
 for a lease which does not exist. The process which failed exits with `Reason` (not `normal`),

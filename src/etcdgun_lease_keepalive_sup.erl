@@ -2,7 +2,7 @@
 
 -behaviour(supervisor).
 
--export([start_link/0, init/1, start_child/2, start_child/3, stop_child/2]).
+-export([start_link/0, init/1, start_child/2, start_child/3, stop_child/2, start_manager/1]).
 
 -define(SERVER, ?MODULE).
 
@@ -28,6 +28,12 @@ start_child(Client, LeaseId) ->
 -spec start_child(etcdgun:client(), integer(), boolean()) ->
     {ok, pid()} | {error, term()}.
 start_child(Client, LeaseId, RevokeWhenShutdown) ->
+    case etcdgun_lease_manager:ensure_started(Client) of
+        ok -> start_lease(Client, LeaseId, RevokeWhenShutdown);
+        {error, _} = Error -> Error
+    end.
+
+start_lease(Client, LeaseId, RevokeWhenShutdown) ->
     Child = #{
         id => {Client, LeaseId},
         start => {etcdgun_lease_keepalive, start_link, [Client, LeaseId, RevokeWhenShutdown]},
@@ -40,6 +46,24 @@ start_child(Client, LeaseId, RevokeWhenShutdown) ->
         {error, already_present} -> {error, already_present};
         {error, {already_started, _}} -> {error, already_started};
         {error, {Reason, _Spec}} -> {error, Reason};
+        {error, _} = E -> E
+    end.
+
+%% @private
+%% The manager of the stream of the client, see `etcdgun_lease_manager'. It is not restarted: the
+%% leases register again.
+-spec start_manager(atom()) -> {ok, pid()} | {error, term()}.
+start_manager(Client) ->
+    Child = #{
+        id => {manager, Client},
+        start => {etcdgun_lease_manager, start_link, [Client]},
+        restart => temporary,
+        shutdown => 5000,
+        type => worker,
+        modules => [etcdgun_lease_manager]},
+    case supervisor:start_child(?SERVER, Child) of
+        {ok, Pid} when is_pid(Pid) -> {ok, Pid};
+        {error, {already_started, _} = E} -> {error, E};
         {error, _} = E -> E
     end.
 
