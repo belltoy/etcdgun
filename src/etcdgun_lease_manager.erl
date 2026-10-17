@@ -125,10 +125,11 @@ handle_event(state_timeout, reconnect, disconnected, Data) ->
     reconnect(Data);
 
 handle_event({timeout, {register, LeaseId}}, register, _State, #data{waiting = Waiting} = Data) ->
-    case maps:take(LeaseId, Waiting) of
-        {From, Waiting1} ->
+    case Waiting of
+        #{LeaseId := From} ->
+            Waiting1 = maps:remove(LeaseId, Waiting),
             {keep_state, Data#data{waiting = Waiting1}, [{reply, From, {error, timeout}}]};
-        error ->
+        _ ->
             keep_state_and_data
     end;
 
@@ -239,17 +240,17 @@ lost(Reason, #data{waiting = Waiting} = Data) ->
     Data1 = disconnect(Data#data{waiting = #{}}),
     Replies = [{reply, From, {error, Reason}} || From <- maps:values(Waiting)],
     Cancels = [{{timeout, {register, Id}}, cancel} || Id <- maps:keys(Waiting)],
-    Data2 = lists:foldl(fun(Id, D) -> drop(Id, D) end, Data1, maps:keys(Waiting)),
+    Data2 = lists:foldl(fun drop/2, Data1, maps:keys(Waiting)),
     {next_state, after_failure(Data2), Data2#data{attempts = Data2#data.attempts + 1},
      Replies ++ Cancels ++ retry(Data2#data{attempts = Data2#data.attempts + 1})}.
 
 %% A lease which is no more registered (its process is gone, or it told so).
 drop(LeaseId, #data{leases = Leases} = Data) ->
-    case maps:take(LeaseId, Leases) of
-        {{_Pid, MRef}, Leases1} ->
+    case Leases of
+        #{LeaseId := {_Pid, MRef}} ->
             erlang:demonitor(MRef, [flush]),
-            Data#data{leases = Leases1};
-        error ->
+            Data#data{leases = maps:remove(LeaseId, Leases)};
+        _ ->
             Data
     end.
 

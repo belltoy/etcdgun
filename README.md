@@ -300,3 +300,9 @@ that one first, as the ports are the same.
 
 Two cases (`member_down` and `member_add_remove`) stop and add etcd members through docker, and
 are skipped if docker is not available.
+
+If you want to run the `rebar shell` (without TLS), copy the `sys.example.config` to
+`sys.dev.config` and run: `rebar3 shell`, you can then call the etcd APIs with `foo` (the name of
+the client in the config) and see the logs of the client printed in the shell. The `sys.dev.config`
+is not committed, so you can change it for your needs, e.g. the endpoints, the credentials, the TLS
+options, the interceptors, etc.

@@ -434,9 +434,9 @@ format_status(Status) ->
 redact(undefined) -> undefined;
 redact(_Secret) -> '<redacted>'.
 
-terminate(_Reason, #state{name = Name, probing = Probing}) ->
+terminate(Reason, #state{name = Name, probing = Probing}) ->
     [exit(Pid, kill) || {Pid, _} <- maps:values(Probing)],
-    ?LOG_NOTICE("Terminating etcdgun client, reason: ~p", [_Reason]),
+    ?LOG_NOTICE("Terminating etcdgun client ~s, reason: ~p", [Name, Reason]),
     _ = egrpc_channel:stop(Name),
     ets:delete(?TOKEN_TABLE, Name),
     ok.
@@ -734,6 +734,7 @@ usable_members_test() ->
 publish_token_test() ->
     ets:new(?TOKEN_TABLE, [set, named_table, public]),
     try
+        % eqwalizer:ignore
         State = #state{name = foo, token = <<"t1">>},
         ?assertEqual(undefined, cached_token(foo)),
         ?assertEqual(State, publish_token(State)),
@@ -753,6 +754,7 @@ finish_refresh_test() ->
     Refresh = #refresh{pid = self(), mref = make_ref(), cred = Cred, waiters = [From]},
     ets:new(?TOKEN_TABLE, [set, named_table, public]),
     try
+        % eqwalizer:ignore
         State = #state{name = foo, cred = Cred, token = <<"old">>, refreshing = Refresh},
         %% A token: published, the waiters get it
         S1 = finish_refresh({ok, <<"new">>}, State),
@@ -777,11 +779,13 @@ finish_refresh_test() ->
     end.
 
 format_status_test() ->
+    % eqwalizer:ignore
     State = #state{name = foo, cred = {<<"root">>, <<"secret">>}, token = <<"token">>},
     #{state := Redacted} = format_status(#{state => State}),
     ?assertEqual('<redacted>', Redacted#state.cred),
     ?assertEqual('<redacted>', Redacted#state.token),
     ?assertEqual(foo, Redacted#state.name),
+    % eqwalizer:ignore
     NoCred = #state{name = foo, cred = undefined, token = undefined},
     ?assertMatch(#{state := #state{cred = undefined, token = undefined}},
                  format_status(#{state => NoCred})),
@@ -789,6 +793,7 @@ format_status_test() ->
 
 exit_of_initial_probe_test() ->
     P = spawn(fun() -> ok end),
+    % eqwalizer:ignore
     State = #state{name = foo, init_probes = [P]},
     ?assertMatch({noreply, #state{init_probes = []}}, handle_info({'EXIT', P, normal}, State)),
     %% the exit of any other process is still unexpected, and the probes are kept

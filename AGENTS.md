@@ -33,7 +33,7 @@ just etcd          # Starts 3-node cluster via docker-compose (v3.5.10)
 just clean         # Cleans persistent data (data/etcd-{1,2,3})
 ```
 
-**Dev shell configuration** (`config/sys.dev.config`):
+**Dev shell configuration** (`config/sys.dev.config`, not committed: copy `config/sys.example.config`):
 - Auto-loads etcdgun app with dev client config
 - Auth: username=`"root"`, password=`"123456"` (hardcoded for dev testing)
 - Interceptors loaded: stream auth, unary auth token refresh, request logging

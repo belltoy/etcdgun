@@ -201,7 +201,7 @@ prefix_range_end_binary_test() ->
     ?assertEqual(<<"b">>, prefix_range_end(<<"a">>)),
     ?assertEqual(<<"ab">>, prefix_range_end(<<"aa">>)),
     ?assertEqual(<<"a\x02">>, prefix_range_end(<<"a\x01">>)),
-    ?assertEqual(<<"b">>, prefix_range_end(<<"a\xff">>)),
+    ?assertEqual(<<"b">>, prefix_range_end(<<"a", 255>>)),
     ?assertEqual(<<0>>, prefix_range_end(<<>>)),
     ?assertEqual(<<0>>, prefix_range_end(<<255, 255>>)),
     ?assert(is_binary(prefix_range_end(<<"/etcdgun_ct/1/">>))).
