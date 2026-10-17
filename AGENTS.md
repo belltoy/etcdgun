@@ -81,4 +81,4 @@ just clean         # Cleans persistent data (data/etcd-{1,2,3})
 - The suite must pass on etcd 3.5, 3.6 and 3.7, always from a clean cluster as the regression
 
 **Tool Versions** (from .mise.toml):
-- Erlang 27.3, Rebar 3.25.1, ELP otp-27
+- Erlang 27.3, Rebar 3.26.0, ELP otp-27

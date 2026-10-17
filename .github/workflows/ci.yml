@@ -8,6 +8,8 @@ on:
 jobs:
   check:
     runs-on: ubuntu-24.04
+    # OTP 29 is not required to pass yet: a dependency of the plugins (erlware_commons) does not compile on it
+    continue-on-error: ${{ matrix.otp == '29' }}
     strategy:
       fail-fast: false
       matrix:
@@ -17,7 +19,7 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ matrix.otp }}
-          rebar3-version: "3.25.1"
+          rebar3-version: "3.26.0"
       - uses: actions/cache@v4
         with:
           path: |
@@ -42,7 +44,7 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: "27.3"
-          rebar3-version: "3.25.1"
+          rebar3-version: "3.26.0"
       - uses: extractions/setup-just@v2
       - name: Start a clean etcd cluster with auth
         run: just etcd-up ${{ matrix.etcd }} ${{ matrix.tls }}

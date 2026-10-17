@@ -1,4 +1,4 @@
 [tools]
 erlang = "27.3"
 elp = "otp-27"
-rebar = "3.25.1"
+rebar = "3.26.0"
