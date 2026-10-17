@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main, redesign]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        otp: ["27.3", "28", "29"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp }}
+          rebar3-version: "3.25.1"
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/rebar3
+            _build
+          key: check-${{ runner.os }}-otp${{ matrix.otp }}-${{ hashFiles('rebar.config') }}
+      - run: rebar3 compile
+      - run: rebar3 xref
+      - run: rebar3 dialyzer
+      - run: rebar3 eunit
+
+  ct:
+    runs-on: ubuntu-24.04
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        etcd: [v3.5.10, v3.6.5, v3.7.0]
+        tls: [false, true]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.3"
+          rebar3-version: "3.25.1"
+      - uses: extractions/setup-just@v2
+      - name: Start a clean etcd cluster with auth
+        run: just etcd-up ${{ matrix.etcd }} ${{ matrix.tls }}
+      - name: Run the suite
+        run: |
+          if [ "${{ matrix.tls }}" = true ]; then
+            ETCDGUN_CT_TLS_CERTS=$PWD/data/ct/certs rebar3 ct --suite test/etcdgun_tls_SUITE
+          else
+            rebar3 ct --suite test/etcdgun_SUITE
+          fi
+      - name: Logs of the cluster
+        if: failure()
+        run: COMPOSE_PROJECT_NAME=etcdgun-ct ETCD_DATA_DIR=data/ct docker compose logs --no-color | tail -500
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: ct-logs-${{ matrix.etcd }}-tls-${{ matrix.tls }}
+          path: _build/test/logs
+      - name: Destroy the cluster
+        if: always()
+        run: just etcd-ct-destroy

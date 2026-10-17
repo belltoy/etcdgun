@@ -75,7 +75,7 @@ just clean         # Cleans persistent data (data/etcd-{1,2,3})
 **Dev & Testing:**
 - Integration tests require running etcd cluster (`just etcd`)
 - Dev config hardcodes auth for testing; change via `etcdgun_client:update_cred/3` at runtime
-- A few inline eunit tests and one CT suite (`rebar3 ct`); no CI workflows
+- A few inline eunit tests and one CT suite (`rebar3 ct`); CI in `.github/workflows/ci.yml` (check, then the CT suites on every etcd version)
 - `just etcd-down` removes the cluster containers, the data in `data/` is kept
 - The test clusters (`etcd-up`, `ct-all`) are a separate compose project with their own data in `data/ct/`, never `data/etcd-*` of `just etcd`; destroy them with `just etcd-ct-destroy`
 - The suite must pass on etcd 3.5, 3.6 and 3.7, always from a clean cluster as the regression
