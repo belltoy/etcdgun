@@ -48,6 +48,10 @@ jobs:
       - uses: extractions/setup-just@v2
       - name: Start a clean etcd cluster with auth
         run: just etcd-up ${{ matrix.etcd }} ${{ matrix.tls }}
+      # The case partitioned_member cuts the network of a member with this image, it is skipped
+      # if the image is not there.
+      - name: Pull the image of the fault tests
+        run: docker pull alpine:3.22
       - name: Run the suite
         run: |
           if [ "${{ matrix.tls }}" = true ]; then
