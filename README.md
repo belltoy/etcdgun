@@ -1,4 +1,6 @@
-[![Hex Version](https://img.shields.io/hexpm/v/etcdgun.svg)](https://hex.pm/packages/etcdgun) [![Hex Docs](https://img.shields.io/badge/docs-hexpm-blue.svg)](https://hexdocs.pm/etcdgun/)
+[![Hex Version](https://img.shields.io/hexpm/v/etcdgun.svg)](https://hex.pm/packages/etcdgun)
+[![Hex Docs](https://img.shields.io/badge/docs-hexpm-blue.svg)](https://hexdocs.pm/etcdgun/)
+[![CI](https://github.com/belltoy/etcdgun/actions/workflows/ci.yml/badge.svg?branch=redesign)](https://github.com/belltoy/etcdgun/actions/workflows/ci.yml)
 
 An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrpc](https://github.com/belltoy/egrpc).
 
