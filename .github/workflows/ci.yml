@@ -8,8 +8,6 @@ on:
 jobs:
   check:
     runs-on: ubuntu-24.04
-    # OTP 29 is not required to pass yet: a dependency of the plugins (erlware_commons) does not compile on it
-    continue-on-error: ${{ matrix.otp == '29' }}
     strategy:
       fail-fast: false
       matrix:
