@@ -27,7 +27,7 @@ jobs:
       - run: rebar3 compile
       - run: rebar3 xref
       - run: rebar3 dialyzer
-      - run: rebar3 eunit
+      - run: rebar3 eunit -v -c
 
   ct:
     runs-on: ubuntu-24.04
@@ -52,11 +52,16 @@ jobs:
         run: docker pull alpine:3.22
       - name: Run the suite
         run: |
+          rebar3 eunit -v -c
           if [ "${{ matrix.tls }}" = true ]; then
-            ETCDGUN_CT_TLS_CERTS=$PWD/data/ct/certs rebar3 ct --suite test/etcdgun_tls_SUITE
+            ETCDGUN_CT_TLS_CERTS=$PWD/data/ct/certs rebar3 ct -v -c --suite test/etcdgun_tls_SUITE
           else
-            rebar3 ct --suite test/etcdgun_SUITE
+            rebar3 ct -v -c --suite test/etcdgun_SUITE
           fi
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverdata-${{ matrix.etcd }}-tls-${{ matrix.tls }}
+          path: _build/test/cover/*.coverdata
       - name: Logs of the cluster
         if: failure()
         run: COMPOSE_PROJECT_NAME=etcdgun-ct ETCD_DATA_DIR=data/ct docker compose logs --no-color | tail -500
@@ -68,3 +73,29 @@ jobs:
       - name: Destroy the cluster
         if: always()
         run: just etcd-ct-destroy
+
+  coverage:
+    runs-on: ubuntu-24.04
+    needs: ct
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: "27.3"
+          rebar3-version: "3.26.0"
+      # One directory for every run, the files of the runs have the same names.
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: coverdata-*
+          path: coverdata
+      - name: Coverage of all the runs
+        run: |
+          mkdir -p _build/test/cover
+          for f in coverdata/*/*.coverdata; do
+            cp "$f" "_build/test/cover/$(basename "$(dirname "$f")")-$(basename "$f")"
+          done
+          rebar3 cover -v
+      - uses: actions/upload-artifact@v7
+        with:
+          name: coverage-report
+          path: _build/test/cover
