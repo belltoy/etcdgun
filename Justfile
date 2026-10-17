@@ -66,7 +66,8 @@ etcd-up version="v3.5.10" tls="false":
 # Remove the containers and the data of the clusters of `etcd-up`
 etcd-ct-destroy:
     @COMPOSE_PROJECT_NAME=etcdgun-ct ETCD_DATA_DIR=data/ct docker compose down -v
-    @rm -rf data/ct
+    @# On Linux the data was written by root in the containers, the same image removes it.
+    @rm -rf data/ct 2>/dev/null || docker run --rm -v "$PWD/data:/data" alpine:3.22 rm -rf /data/ct
 
 # Run the CT suites on every etcd version, each from a clean cluster destroyed afterwards
 ct-all:
