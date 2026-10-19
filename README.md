@@ -32,7 +32,8 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
 - [x] an endpoint is checked (health service, and the member knows a leader) when it connects and is
   not used until it passes, then again every 10 seconds (every second while it does not pass);
   the requests carry `hasleader`, so a member without a leader refuses them at once.
-- [ ] leader aware calls, temporary penalty of endpoints which fail often.
+- [ ] leader aware calls.
+- [ ] temporary penalty of endpoints which fail often.
 - [x] idle connection keep alive: the HTTP/2 `PING` of gun, off by default, see
   [Connection keepalive](#connection-keepalive).
 
