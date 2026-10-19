@@ -79,7 +79,10 @@ stop_child(Client, WatcherName) ->
     %% asks: it is killed after its shutdown time. A handler asks with its return.
     whereis(WatcherName) =:= self() andalso error(called_from_the_handler),
     %% The child is temporary, its spec is gone with it.
-    supervisor:terminate_child(?MODULE, {Client, WatcherName}).
+    case supervisor:terminate_child(?MODULE, {Client, WatcherName}) of
+        ok -> ok;
+        {error, not_found} -> {error, not_found}
+    end.
 
 %% @doc Stop the watchers of a client, they have nothing to watch with when it is closed.
 -spec stop_children(atom()) -> ok.

@@ -116,7 +116,6 @@ client_info(Client) ->
 update_cred(Client, Username, Password) ->
     case normalize_cred({Username, Password}) of
         {ok, Cred} ->
-            % eqwalizer:ignore
             gen_server:call(Client, {update_cred, Cred});
         {error, _} = Error ->
             Error
@@ -151,7 +150,6 @@ to_binary(_) ->
 
 -spec unset_cred(etcdgun:client()) -> ok.
 unset_cred(Client) ->
-    % eqwalizer:ignore
     gen_server:call(Client, {update_cred, undefined}).
 
 %% @doc Refresh the token, whatever the current one is. See `refresh_token/2'.
@@ -178,7 +176,6 @@ refresh_token(Client, Stale) ->
         true -> {error, in_client_process};
         false ->
             try
-                % eqwalizer:ignore
                 gen_server:call(Client, {refresh_token, Stale}, ?REFRESH_CALL_TIMEOUT)
             catch
                 exit:{timeout, _} -> {error, timeout}

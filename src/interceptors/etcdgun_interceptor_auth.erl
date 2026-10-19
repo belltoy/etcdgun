@@ -102,6 +102,7 @@ map_error(Res) -> Res.
 current_token(Call) ->
     case egrpc_call:info(Call) of
         #{client := Client} ->
+            % eqwalizer:ignore
             case etcdgun_client:cached_token(Client) of
                 {ok, Token} -> Token;
                 undefined -> undefined
@@ -115,6 +116,7 @@ no_refresh(Call) ->
 
 refresh_token(Call, Stale) ->
     case egrpc_call:info(Call) of
+        % eqwalizer:ignore
         #{client := Client} -> etcdgun_client:refresh_token(Client, Stale);
         _ -> {error, not_a_client}
     end.

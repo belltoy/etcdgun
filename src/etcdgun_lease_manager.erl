@@ -43,6 +43,7 @@
 %% The registered name of the manager of a client.
 -spec name(atom()) -> atom().
 name(Client) ->
+    % elp:ignore W0023
     binary_to_atom(<<"etcdgun_lease_manager_", (atom_to_binary(Client))/binary>>).
 
 start_link(Client) ->

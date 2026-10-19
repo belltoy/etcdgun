@@ -527,7 +527,6 @@ grpc_status(Bin) ->
     end.
 
 is_auth_error(Reason) ->
-    % eqwalizer:ignore
     lists:any(fun(Text) -> binary:match(Reason, Text) =/= nomatch end,
               [<<"invalid auth token">>, <<"user name is empty">>,
                <<"revision of auth store is old">>]).
@@ -566,7 +565,6 @@ last_revision(Response, Last) ->
 
 -spec last_revision(map()) -> integer().
 last_revision(#{events := [_ | _] = Events}) ->
-    % eqwalizer:ignore
     lists:max([maps:get(mod_revision, Kv, 0) || #{kv := Kv} <- Events]);
 last_revision(#{header := #{revision := Revision}}) ->
     Revision.

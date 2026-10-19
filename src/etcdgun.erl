@@ -183,7 +183,6 @@ prefix_range_end(Key) when is_binary(Key) ->
 
 prefix_range_end(Key) when is_list(Key) ->
     RangeEndRev = lists:reverse(Key),
-    % eqwalizer:ignore
     lists:reverse(find_prefix_rev(RangeEndRev)).
 
 find_prefix_rev([]) -> ?UNBOUND_RANGE_END;
