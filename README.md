@@ -33,7 +33,8 @@ An etcd client built on top of [gun](https://github.com/ninenines/gun) and [egrp
   not used until it passes, then again every 10 seconds (every second while it does not pass);
   the requests carry `hasleader`, so a member without a leader refuses them at once.
 - [ ] leader aware calls, temporary penalty of endpoints which fail often.
-- [ ] idle connection keep alive?
+- [x] idle connection keep alive: the HTTP/2 `PING` of gun, off by default, see
+  [Connection keepalive](#connection-keepalive).
 
 Generating etcd v3 API codes via the proto files in etcd v3.5.10, without changing their packets.
 
@@ -227,6 +228,35 @@ scheme, so `transport => tls` tells that they are TLS, and `gun_opts` are the op
 The certificate of the server is verified by the TLS options of gun and OTP. Pass the options of
 `ssl` in `tls_opts`, e.g. `{cacerts, ...}` or the client certificate with `{certfile, _}` and
 `{keyfile, _}` for a cluster which has `--client-cert-auth`.
+
+### Connection keepalive
+
+etcdgun does not ping the connections itself. [gun](https://hex.pm/packages/gun) sends HTTP/2
+`PING` frames when `keepalive` is set in its `http2_opts`, which are passed in `gun_opts` (off by
+default, `infinity`):
+
+```erlang
+{ok, _} = etcdgun:open(my_client, [{"etcd.example.com", 2379}], #{
+    gun_opts => #{http2_opts => #{keepalive => 30_000, keepalive_tolerance => 2}}
+}).
+```
+
+A connection is closed (and opened again by egrpc) when `keepalive_tolerance` pings in a row got
+no answer.
+
+The etcd server limits the pings of the clients (`--grpc-keepalive-min-time`, 5 seconds by
+default, and the server is built with `PermitWithoutStream: false`, in etcd 3.5, 3.6 and 3.7):
+
+- Do not set `keepalive` below the `--grpc-keepalive-min-time` of the cluster, 5 seconds by
+  default; the server counts the pings which come sooner as abuse and closes the connection
+  (`GOAWAY`, `too_many_pings`).
+- Because of `PermitWithoutStream: false`, a connection which has no open stream (no watch, no
+  lease keepalive, no call going on) is not allowed to be pinged by default: by the rules of
+  grpc-go such a ping counts as abuse unless it comes 2 hours after the last one. So `keepalive`
+  helps the connections which have a watch or the lease keepalive stream open; it is not a way to
+  keep a fully idle connection open on a default etcd (there is no flag of etcd for it).
+- The server pings the clients too (`--grpc-keepalive-interval`, 2 hours, and
+  `--grpc-keepalive-timeout`, 20 seconds), and gun answers them.
 
 ### API Call
 
